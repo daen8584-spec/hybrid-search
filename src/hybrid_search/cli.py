@@ -17,7 +17,7 @@ from typing import Any
 
 from .config import Settings, load_dotenv
 from .db import embedding_dimensions, migrate, open_pool
-from .embeddings import OpenAICompatibleEmbedder
+from .embeddings import EmbeddingError, OpenAICompatibleEmbedder
 from .evaluation.beir import CorpusDocument, iter_corpus, load_dataset, safe_extract
 from .evaluation.metrics import mrr_at_k, ndcg_at_k, percentile, recall_at_k
 from .ingest import Ingestor
@@ -35,6 +35,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     settings = Settings.from_env()
     configure_logging(settings.log_level)
+    from psycopg import OperationalError
+
     try:
         result = args.handler(args, settings)
         if asyncio.iscoroutine(result):
@@ -42,6 +44,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(result or 0)
     except KeyboardInterrupt:
         return 130
+    except EmbeddingError as error:
+        print(f"error: {error} ({settings.embedding_base_url})", file=sys.stderr)
+        return 1
+    except OperationalError as error:
+        print(f"error: database unavailable: {error}".rstrip(), file=sys.stderr)
+        return 1
 
 
 def _parser() -> argparse.ArgumentParser:

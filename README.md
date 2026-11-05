@@ -15,6 +15,71 @@ A retrieval service that combines BM25 keyword search with pgvector similarity s
 - **Observability** through JSON logs with request ids and per-request timing
 - **Tested** with unit tests and integration tests against PostgreSQL with pgvector in CI, with strict type checking
 
+## Results
+
+Measured on 2026-11-05 on an Android tablet (MediaTek MT8792, 8 GB RAM) under Termux, with PostgreSQL and pgvector on the same device and `nomic-embed-text-v1.5` (Q8_0) served locally by `llama-server`. The dataset is [SciFact](https://github.com/allenai/scifact) from BEIR: 5,183 abstracts, ingested as 5,766 chunks, and 300 test queries.
+
+### Retrieval quality
+
+| Mode | nDCG@10 | Recall@10 | Recall@100 | MRR@10 | p50 | p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Keyword (BM25) | 0.688 | 0.830 | 0.918 | 0.648 | 22.0 ms | 44.2 ms |
+| Vector (HNSW) | 0.700 | 0.843 | 0.928 | 0.663 | 16.4 ms | 22.7 ms |
+| **Hybrid (RRF)** | **0.719** | **0.847** | **0.958** | **0.684** | 18.3 ms | 27.1 ms |
+
+Hybrid search improves on both retrievers on every metric, most clearly in Recall@100, where the two retrievers find different relevant documents. For reference, the BEIR paper reports nDCG@10 0.665 for BM25 on SciFact.
+
+Latency is retrieval and fusion for the top 100 documents, measured in process with the query embedding already computed. Embedding a query with the local model took a further 100 to 400 ms per query on this device.
+
+### What the first measurement changed
+
+The first evaluation used PostgreSQL's built-in `ts_rank_cd` for keyword ranking and an `ef_search` default of 100:
+
+| Mode | nDCG@10 first | nDCG@10 now | p50 first | p50 now |
+| --- | ---: | ---: | ---: | ---: |
+| Keyword | 0.399 | 0.688 | 374 ms | 22.0 ms |
+| Vector | 0.700 | 0.700 | 40.9 ms | 16.4 ms |
+| Hybrid | 0.602 | 0.719 | 386 ms | 18.3 ms |
+
+Keyword ranking had no inverse document frequency and ranked nearly every chunk for every query, and its weak ranking pulled hybrid search below vector search alone. It was replaced with BM25 over an inverted index in PostgreSQL ([0007](docs/adr/0007-bm25-in-postgresql.md)). The first HNSW sweep showed that the query planner had switched to a sequential scan at the old `ef_search` default, so vector search had been exact rather than indexed ([0005](docs/adr/0005-hnsw-index.md)).
+
+### Fusion weight
+
+Chosen on the 809 **train** queries, so that the test queries above were not used for tuning:
+
+| Keyword weight | nDCG@10 | Recall@100 |
+| ---: | ---: | ---: |
+| 0 (vector only) | 0.725 | 0.940 |
+| 0.3 | 0.739 | 0.940 |
+| 0.5 | 0.736 | 0.958 |
+| 1.0 | 0.738 | 0.956 |
+
+nDCG@10 is flat within 0.005 for weights from 0.2 to 1.0, while Recall@100 improves from 0.4 upward. The default stays at equal weights.
+
+### HNSW recall
+
+| `ef_search` | Recall@10 vs exact | nDCG@10 | p50 | p95 |
+| ---: | ---: | ---: | ---: | ---: |
+| exact | 1.000 | 0.700 | 44.2 ms | 60.8 ms |
+| 10 | 0.907 | 0.688 | 4.7 ms | 6.4 ms |
+| 20 | 0.954 | 0.702 | 4.4 ms | 6.2 ms |
+| **40 (default)** | 0.987 | 0.700 | 4.8 ms | 6.0 ms |
+| 80 | 0.996 | 0.700 | 5.6 ms | 6.8 ms |
+| 160 | 1.000 | 0.700 | 6.5 ms | 8.6 ms |
+
+### HTTP API under load
+
+`GET /search` in hybrid mode, 4 concurrent clients, each of the 300 test queries sent once per pass:
+
+| Pass | Throughput | p50 | p95 | p99 | Errors |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cold: query embedded by the model | 3.7 req/s | 1,060 ms | 1,394 ms | 1,702 ms | 0 |
+| Warm: query embedding cached | 55.0 req/s | 71.6 ms | 89.2 ms | 102.5 ms | 0 |
+
+With uncached queries, throughput is bounded by the embedding model, which runs on the same CPU and serves one request at a time. The warm pass isolates the service itself: retrieval, fusion and HTTP handling.
+
+Ingesting the corpus embedded about 1.8 million tokens and took about three hours on this device, almost all of it in the embedding model.
+
 ## Architecture
 
 ```mermaid
