@@ -137,7 +137,7 @@ class SearchService:
         stats_ttl_seconds: float = 60.0,
         reranker: Reranker | None = None,
         rerank_depth: int = 20,
-        rerank_weight: float = 1.0,
+        rerank_weight: float = 0.25,
     ) -> None:
         self._pool = pool
         self._embedder = embedder

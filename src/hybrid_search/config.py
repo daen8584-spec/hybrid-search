@@ -81,6 +81,6 @@ class Settings:
             rerank_model=env.get("RERANK_MODEL", "jina-reranker-v1-turbo-en"),
             rerank_api_key=env.get("RERANK_API_KEY") or None,
             rerank_depth=_int("RERANK_DEPTH", 20),
-            rerank_weight=_float("RERANK_WEIGHT", 1.0),
+            rerank_weight=_float("RERANK_WEIGHT", 0.25),
             log_level=env.get("LOG_LEVEL", "INFO").upper(),
         )

@@ -59,6 +59,22 @@ Chosen on the 809 **train** queries, so that the test queries above were not use
 
 nDCG@10 is flat within 0.005 for weights from 0.2 to 1.0, while Recall@100 improves from 0.4 upward. The default stays at equal weights.
 
+### Reranking
+
+Measured on 300 randomly sampled **train** queries with `tune-rerank`, reranking the top 20 hybrid results with `jina-reranker-v1-turbo-en` (38M parameters) served by `llama-server` on the same tablet:
+
+| Rerank weight | nDCG@10 | Recall@10 |
+| ---: | ---: | ---: |
+| 0 (no reranking) | 0.725 | 0.844 |
+| 0.25 | 0.729 | 0.851 |
+| 0.5 | 0.724 | 0.849 |
+| 1 | 0.704 | 0.830 |
+| 2 | 0.674 | 0.805 |
+| 4 | 0.656 | 0.796 |
+| Reranker order only | 0.634 | 0.796 |
+
+On this dataset, this small reranker is weaker than the first stage. Ordering the top 20 by its scores alone lowers nDCG@10 from 0.725 to 0.634. Fusing its order with the hybrid order keeps that loss out of the results, and at the best weight, 0.25, the gain of 0.004 is within the variation expected from 300 queries. It costs a median of 6.1 s per search on this device. Reranking therefore stays off by default (`rerank=false`), and the default weight of 0.25 applies when a request enables it. The stage accepts any `/rerank` endpoint, so a larger cross-encoder or a hosted reranking API can be evaluated with the same two commands; that was not measured here.
+
 ### HNSW recall
 
 | `ef_search` | Recall@10 vs exact | nDCG@10 | p50 | p95 |
@@ -199,7 +215,7 @@ hybrid-search serve --port 8000
 | `RERANK_BASE_URL` | none | Base URL of a `/rerank` endpoint; reranking is disabled without it |
 | `RERANK_MODEL`, `RERANK_API_KEY` | `jina-reranker-v1-turbo-en`, none | Reranking model and optional bearer token |
 | `RERANK_DEPTH` | `20` | Number of top results sent to the reranker |
-| `RERANK_WEIGHT` | `1.0` | Weight of the reranker's ranking relative to the first stage; `inf` uses the reranker's order; see `tune-rerank` |
+| `RERANK_WEIGHT` | `0.25` | Weight of the reranker's ranking relative to the first stage; `inf` uses the reranker's order; see `tune-rerank` |
 | `LOG_LEVEL` | `INFO` | Log level |
 
 ## Evaluation
