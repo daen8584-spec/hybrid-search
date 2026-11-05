@@ -1,5 +1,7 @@
 # hybrid-search
 
+[![CI](https://github.com/daen8584-spec/hybrid-search/actions/workflows/ci.yml/badge.svg)](https://github.com/daen8584-spec/hybrid-search/actions/workflows/ci.yml)
+
 A retrieval service that combines BM25 keyword search with pgvector similarity search, both inside PostgreSQL, and merges the two with Reciprocal Rank Fusion. It is built to be measured: an evaluation command reports nDCG, recall and MRR on a standard BEIR benchmark for each retrieval mode, a sweep measures the recall cost of the approximate vector index, and a load test reports latency percentiles of the running API.
 
 ## Features
@@ -255,3 +257,7 @@ docs/adr/         Architecture Decision Records
 - Keyword search counts document frequencies at query time and skips chunks that contain only very common query terms. Both are exact or measured at this scale; see [0007](docs/adr/0007-bm25-in-postgresql.md) for what changes at a larger one.
 - Token counts used for chunking are approximate and independent of the embedding model's tokenizer. The default chunk size leaves a wide margin below the model's context length.
 - The query embedding cache is per process. Several API processes each maintain their own.
+
+## License
+
+[MIT](LICENSE)
