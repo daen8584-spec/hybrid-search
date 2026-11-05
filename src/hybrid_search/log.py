@@ -39,3 +39,6 @@ def configure_logging(level: str = "INFO") -> None:
     root.setLevel(level)
     # uvicorn's access log duplicates the request log written by the API middleware.
     logging.getLogger("uvicorn.access").disabled = True
+    # httpx logs every request at INFO, which floods the output during ingestion.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(max(logging.WARNING, root.level))

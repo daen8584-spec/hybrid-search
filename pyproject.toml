@@ -28,6 +28,10 @@ packages = ["src/hybrid_search"]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 markers = ["integration: requires PostgreSQL with the pgvector extension"]
+filterwarnings = [
+  # Emitted by Starlette whenever fastapi.testclient is imported; not actionable here.
+  "ignore:Using .httpx. with .starlette.testclient. is deprecated",
+]
 
 [tool.ruff]
 line-length = 110
