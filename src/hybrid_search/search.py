@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -13,26 +14,58 @@ from .fusion import reciprocal_rank_fusion
 if TYPE_CHECKING:
     from psycopg_pool import AsyncConnectionPool
 
+    from .config import Settings
     from .embeddings import Embedder
 
 SearchMode = Literal["keyword", "vector", "hybrid"]
 SEARCH_MODES: tuple[SearchMode, ...] = ("keyword", "vector", "hybrid")
 
-# plainto_tsquery joins terms with AND, which rarely matches a full natural-language query.
-# Rewriting the operators to OR makes every term optional and lets ts_rank_cd reward
-# chunks that contain more of them, closer together. See docs/adr/0002.
+# BM25 over the chunk_terms inverted index (docs/adr/0007).
+#
+# Candidates are the chunks that contain at least one selective query term: a term whose
+# document frequency is at most max_df, or one of the rarest terms until their combined
+# postings reach min_candidates. Candidates are then scored with every query term. Chunks
+# that contain only very common terms are skipped, which bounds the work per query without
+# changing the top results in practice, because those terms carry little weight.
 _KEYWORD_SQL = """
-with q as (
-    select replace(plainto_tsquery('english', %(query)s)::text, ' & ', ' | ')::tsquery as query
+with query_terms as (
+    select distinct t.lexeme from unnest(to_tsvector('english', %(query)s)) as t
+),
+term_weights as (
+    select q.lexeme, df.df, ln(1 + (%(n)s - df.df + 0.5) / (df.df + 0.5)) as idf
+    from query_terms q
+    cross join lateral (select count(*) as df from chunk_terms p where p.lexeme = q.lexeme) df
+    where df.df > 0
+),
+ordered as (
+    select lexeme, df,
+        coalesce(sum(df) over (order by df, lexeme rows between unbounded preceding and 1 preceding), 0)
+            as rarer_df
+    from term_weights
+),
+selective as (
+    select lexeme from ordered where df <= %(max_df)s or rarer_df < %(min_candidates)s
+),
+candidates as (
+    select distinct p.chunk_id from selective s join chunk_terms p on p.lexeme = s.lexeme
+),
+scored as (
+    select p.document_id, p.chunk_id,
+        sum(
+            w.idf * p.tf * (%(k1)s + 1)
+            / (p.tf + %(k1)s * (1 - %(b)s + %(b)s * p.chunk_length / %(avgdl)s))
+        ) as score
+    from candidates c
+    cross join term_weights w
+    join chunk_terms p on p.lexeme = w.lexeme and p.chunk_id = c.chunk_id
+    group by p.document_id, p.chunk_id
 ),
 best as (
-    select distinct on (c.document_id)
-        c.document_id, c.id, ts_rank_cd(c.search_vector, q.query) as score
-    from chunks c, q
-    where c.search_vector @@ q.query
-    order by c.document_id, score desc, c.id
+    select distinct on (document_id) document_id, chunk_id, score
+    from scored
+    order by document_id, score desc, chunk_id
 )
-select document_id, id, score from best order by score desc, document_id limit %(limit)s
+select document_id, chunk_id, score from best order by score desc, document_id limit %(limit)s
 """
 
 # The inner query must order by the distance operator alone for the HNSW index to be used.
@@ -50,6 +83,12 @@ best as (
 )
 select document_id, id, 1 - distance as score from best order by distance, document_id limit %(limit)s
 """
+
+
+@dataclass(frozen=True, slots=True)
+class CorpusStats:
+    chunks: int
+    mean_length: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,9 +123,14 @@ class SearchService:
         pool: AsyncConnectionPool,
         embedder: Embedder,
         candidates: int = 100,
-        ef_search: int = 100,
+        ef_search: int = 40,
         rrf_k: int = 60,
         weights: Mapping[str, float] | None = None,
+        bm25_k1: float = 1.2,
+        bm25_b: float = 0.75,
+        max_df_fraction: float = 0.1,
+        min_candidates: int = 1_000,
+        stats_ttl_seconds: float = 60.0,
     ) -> None:
         self._pool = pool
         self._embedder = embedder
@@ -94,10 +138,56 @@ class SearchService:
         self.ef_search = ef_search
         self.rrf_k = rrf_k
         self.weights = dict(weights or {"keyword": 1.0, "vector": 1.0})
+        self.bm25_k1 = bm25_k1
+        self.bm25_b = bm25_b
+        self.max_df_fraction = max_df_fraction
+        self.min_candidates = min_candidates
+        self._stats_ttl = stats_ttl_seconds
+        self._stats: tuple[float, CorpusStats] | None = None
+
+    @classmethod
+    def from_settings(
+        cls, pool: AsyncConnectionPool, embedder: Embedder, settings: Settings
+    ) -> SearchService:
+        return cls(
+            pool,
+            embedder,
+            ef_search=settings.hnsw_ef_search,
+            weights={"keyword": settings.fusion_keyword_weight, "vector": 1.0},
+        )
+
+    async def corpus_stats(self) -> CorpusStats:
+        """Chunk count and mean chunk length for BM25, cached for stats_ttl_seconds.
+
+        These change slowly as documents are added, so a short-lived cache avoids a
+        full count on every query at the cost of slightly stale length normalization.
+        """
+        now = time.monotonic()
+        if self._stats is not None and now - self._stats[0] < self._stats_ttl:
+            return self._stats[1]
+        async with self._pool.connection() as conn:
+            cursor = await conn.execute("select count(*), coalesce(avg(term_count), 0) from chunks")
+            row = await cursor.fetchone()
+        stats = CorpusStats(chunks=int(row[0]), mean_length=float(row[1])) if row else CorpusStats(0, 0.0)
+        self._stats = (now, stats)
+        return stats
 
     async def keyword(self, query: str, limit: int) -> list[Candidate]:
+        stats = await self.corpus_stats()
+        if stats.chunks == 0:
+            return []
+        params = {
+            "query": query,
+            "limit": limit,
+            "n": stats.chunks,
+            "avgdl": max(stats.mean_length, 1.0),
+            "k1": self.bm25_k1,
+            "b": self.bm25_b,
+            "max_df": int(stats.chunks * self.max_df_fraction),
+            "min_candidates": self.min_candidates,
+        }
         async with self._pool.connection() as conn:
-            cursor = await conn.execute(_KEYWORD_SQL, {"query": query, "limit": limit})
+            cursor = await conn.execute(_KEYWORD_SQL, params)
             rows = await cursor.fetchall()
         return [Candidate(document_id, chunk_id, float(score)) for document_id, chunk_id, score in rows]
 
@@ -124,6 +214,10 @@ class SearchService:
                 # Keeps scanning the graph when ef_search is smaller than the requested row count,
                 # while still returning rows in exact distance order (pgvector 0.8 and later).
                 await conn.execute("select set_config('hnsw.iterative_scan', 'strict_order', true)")
+                # The planner's HNSW cost estimate grows with ef_search, and on a corpus of this size
+                # it switches to a sequential scan from ef_search 80 upward although the index is
+                # several times faster. Approximate mode always uses the index (docs/adr/0005).
+                await conn.execute("select set_config('enable_seqscan', 'off', true)")
             cursor = await conn.execute(_VECTOR_SQL, params)
             rows = await cursor.fetchall()
         return [Candidate(document_id, chunk_id, float(score)) for document_id, chunk_id, score in rows]

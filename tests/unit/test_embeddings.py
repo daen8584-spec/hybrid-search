@@ -25,6 +25,8 @@ def settings(**overrides: object) -> Settings:
         "embedding_timeout_seconds": 5.0,
         "chunk_max_tokens": 384,
         "chunk_overlap_tokens": 48,
+        "hnsw_ef_search": 40,
+        "fusion_keyword_weight": 1.0,
         "log_level": "INFO",
     }
     values.update(overrides)

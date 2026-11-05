@@ -30,6 +30,14 @@ def _int(name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from error
 
 
+def _float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "")
+    try:
+        return float(raw) if raw else default
+    except ValueError as error:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from error
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     database_url: str
@@ -43,6 +51,8 @@ class Settings:
     embedding_timeout_seconds: float
     chunk_max_tokens: int
     chunk_overlap_tokens: int
+    hnsw_ef_search: int
+    fusion_keyword_weight: float
     log_level: str
 
     @classmethod
@@ -57,8 +67,10 @@ class Settings:
             embedding_query_prefix=env.get("EMBEDDING_QUERY_PREFIX", "search_query: "),
             embedding_document_prefix=env.get("EMBEDDING_DOCUMENT_PREFIX", "search_document: "),
             embedding_batch_size=_int("EMBEDDING_BATCH_SIZE", 16),
-            embedding_timeout_seconds=float(env.get("EMBEDDING_TIMEOUT_SECONDS", "60")),
+            embedding_timeout_seconds=_float("EMBEDDING_TIMEOUT_SECONDS", 60.0),
             chunk_max_tokens=_int("CHUNK_MAX_TOKENS", 384),
             chunk_overlap_tokens=_int("CHUNK_OVERLAP_TOKENS", 48),
+            hnsw_ef_search=_int("HNSW_EF_SEARCH", 40),
+            fusion_keyword_weight=_float("FUSION_KEYWORD_WEIGHT", 1.0),
             log_level=env.get("LOG_LEVEL", "INFO").upper(),
         )

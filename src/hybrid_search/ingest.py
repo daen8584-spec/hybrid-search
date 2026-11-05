@@ -124,6 +124,16 @@ class Ingestor:
                         for chunk, key in zip(chunks, keys, strict=True)
                     ],
                 )
+            # Postings for BM25. Old ones were removed with the old chunks by the foreign key cascade.
+            await conn.execute(
+                """
+                insert into chunk_terms (lexeme, chunk_id, document_id, tf, chunk_length)
+                select t.lexeme, c.id, c.document_id, greatest(cardinality(t.positions), 1), c.term_count
+                from chunks c cross join lateral unnest(c.search_vector) as t
+                where c.document_id = %s
+                """,
+                (document_id,),
+            )
 
         return IngestResult(
             document_id=document_id,

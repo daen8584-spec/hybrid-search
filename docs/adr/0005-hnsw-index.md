@@ -12,11 +12,12 @@ Approximate search trades recall for speed, and the trade-off is controlled at q
 ## Decision
 
 - Use HNSW with cosine distance and pgvector's defaults for the build parameters (`m = 16`, `ef_construction = 64`).
-- Set `hnsw.ef_search` per query in a transaction-local setting, with a default of 100, and enable `hnsw.iterative_scan = strict_order` (pgvector 0.8 and later) so that requests for more rows than `ef_search` continue scanning the graph while still returning rows in exact distance order.
+- Set `hnsw.ef_search` per query in a transaction-local setting, with a default of 40, and enable `hnsw.iterative_scan = strict_order` (pgvector 0.8 and later) so that requests for more rows than `ef_search` continue scanning the graph while still returning rows in exact distance order.
+- Disable sequential scans for approximate queries. pgvector's cost estimate grows with `ef_search`, and on the evaluation corpus the planner switched to a sequential scan from `ef_search = 80` upward, although the index was several times faster. The first measurement used a default of 100 and therefore measured exact search; forcing the index makes the mode do what its name says and makes the sweep measure the index at every setting.
 - Provide an exact mode that disables index scans for the query, and an `ann-sweep` command that measures recall@k of the index against exact search, the resulting nDCG@10, and latency for a range of `ef_search` values.
 
 ## Consequences
 
-- The default `ef_search` is a measured choice and can be revisited with one command when the corpus or hardware changes.
+- The default `ef_search` is a measured choice: on SciFact, 40 returns 98.7% of the exact top 10 with no change in nDCG@10, at about a tenth of the latency of exact search. It can be revisited with one command when the corpus or hardware changes.
 - At the size of the evaluation corpus, exact search is fast enough that the index mainly demonstrates the mechanism. The sweep shows the recall cost, which grows with the corpus and determines whether the index is still acceptable at a larger scale.
 - Index builds slow down ingestion as the corpus grows. For a large initial load, building the index after inserting the data is faster.

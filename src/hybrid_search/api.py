@@ -76,7 +76,7 @@ def create_app(settings: Settings | None = None, embedder: Embedder | None = Non
             app.state.ingestor = Ingestor(
                 pool, active, settings.chunk_max_tokens, settings.chunk_overlap_tokens
             )
-            app.state.search = SearchService(pool, active)
+            app.state.search = SearchService.from_settings(pool, active, settings)
             yield
         finally:
             if owned and isinstance(active, OpenAICompatibleEmbedder):

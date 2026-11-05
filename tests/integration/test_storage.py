@@ -154,3 +154,44 @@ async def test_search_returns_titles_and_snippets(corpus: SearchService) -> None
     [hit] = await corpus.search("vitamin", "keyword", 1)
     assert (hit.document_id, hit.title) == ("vitamin", "Vitamin D")
     assert hit.snippet.startswith("Vitamin D supplementation")
+
+
+async def test_keyword_ranking_weights_rare_terms_above_common_ones(
+    pool: AsyncConnectionPool, embedder: HashingEmbedder
+) -> None:
+    ingestor = Ingestor(pool, embedder)
+    await ingestor.upsert("common", "", "This study of patients reports a study of patients in a study.")
+    await ingestor.upsert("rare", "", "Melatonin was given to patients in this study.")
+    for index in range(4):
+        await ingestor.upsert(f"filler-{index}", "", f"Another study of patients, number {index}.")
+    service = SearchService(pool, embedder)
+
+    results = await service.rank("melatonin study patients", "keyword", 10)
+
+    assert results[0].document_id == "rare"
+    assert len(results) == 6
+
+
+async def test_keyword_index_follows_updates_and_deletes(
+    pool: AsyncConnectionPool, embedder: HashingEmbedder
+) -> None:
+    ingestor = Ingestor(pool, embedder)
+    await ingestor.upsert("d1", "", "Aspirin reduces fever.")
+    service = SearchService(pool, embedder, stats_ttl_seconds=0)
+    assert [d.document_id for d in await service.rank("aspirin", "keyword", 10)] == ["d1"]
+
+    await ingestor.upsert("d1", "", "Ibuprofen reduces fever.")
+    assert await service.rank("aspirin", "keyword", 10) == []
+    assert [d.document_id for d in await service.rank("ibuprofen", "keyword", 10)] == ["d1"]
+
+    await ingestor.delete("d1")
+    assert await service.rank("ibuprofen", "keyword", 10) == []
+    async with pool.connection() as conn:
+        cursor = await conn.execute("select count(*) from chunk_terms")
+        assert await cursor.fetchone() == (0,)
+
+
+async def test_keyword_search_on_an_empty_corpus(
+    pool: AsyncConnectionPool, embedder: HashingEmbedder
+) -> None:
+    assert await SearchService(pool, embedder).rank("anything", "keyword", 10) == []

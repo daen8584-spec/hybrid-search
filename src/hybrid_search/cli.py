@@ -22,7 +22,7 @@ from .evaluation.beir import CorpusDocument, iter_corpus, load_dataset, safe_ext
 from .evaluation.metrics import mrr_at_k, ndcg_at_k, percentile, recall_at_k
 from .ingest import Ingestor
 from .log import configure_logging
-from .search import SEARCH_MODES, SearchMode, SearchService
+from .search import SEARCH_MODES, SearchMode, SearchService, fuse
 
 logger = logging.getLogger("hybrid_search.cli")
 
@@ -82,6 +82,13 @@ def _parser() -> argparse.ArgumentParser:
     command.add_argument("--output", type=Path, default=Path("results"))
     command.set_defaults(handler=cmd_ann_sweep)
 
+    command = commands.add_parser("tune-fusion", help="hybrid quality for a range of keyword weights")
+    command.add_argument("dataset", type=Path)
+    command.add_argument("--split", default="train")
+    command.add_argument("--weights", default="0,0.1,0.2,0.3,0.4,0.5,0.7,1.0")
+    command.add_argument("--output", type=Path, default=Path("results"))
+    command.set_defaults(handler=cmd_tune_fusion)
+
     command = commands.add_parser("bench", help="load test a running API with dataset queries")
     command.add_argument("dataset", type=Path)
     command.add_argument("--url", default="http://127.0.0.1:8000")
@@ -98,6 +105,10 @@ async def cmd_migrate(args: argparse.Namespace, settings: Settings) -> int:
 
     async with await AsyncConnection.connect(settings.database_url, autocommit=True) as conn:
         applied = await migrate(conn)
+        if applied:
+            # Migrations can backfill large tables; fresh statistics and visibility maps let
+            # the planner use index-only scans on chunk_terms immediately.
+            await conn.execute("vacuum (analyze) chunks, chunk_terms")
     print(f"applied: {', '.join(applied)}" if applied else "schema is up to date")
     return 0
 
@@ -185,6 +196,7 @@ async def cmd_ingest_beir(args: argparse.Namespace, settings: Settings) -> int:
 
         await asyncio.gather(*(ingest(document) for document in documents))
         elapsed = time.perf_counter() - started
+        await _vacuum(settings.database_url)
         print(
             json.dumps({**counts, "seconds": round(elapsed, 1), "embedding_tokens": embedder.prompt_tokens})
         )
@@ -201,7 +213,7 @@ async def cmd_eval(args: argparse.Namespace, settings: Settings) -> int:
     embedder = OpenAICompatibleEmbedder(settings)
     try:
         await _check_dimensions(pool, embedder.dimensions)
-        service = SearchService(pool, embedder)
+        service = SearchService.from_settings(pool, embedder, settings)
 
         # Query embeddings are computed once up front, so retrieval latency is measured
         # separately from the embedding call and is comparable across modes.
@@ -261,7 +273,7 @@ async def cmd_ann_sweep(args: argparse.Namespace, settings: Settings) -> int:
     embedder = OpenAICompatibleEmbedder(settings)
     try:
         await _check_dimensions(pool, embedder.dimensions)
-        service = SearchService(pool, embedder)
+        service = SearchService.from_settings(pool, embedder, settings)
         vectors = [await embedder.embed_query(query.text) for query in dataset.queries]
 
         async def run(**options: Any) -> tuple[list[list[str]], list[float]]:
@@ -308,6 +320,56 @@ async def cmd_ann_sweep(args: argparse.Namespace, settings: Settings) -> int:
                 f"| {row['p50']:.2f} | {row['p95']:.2f} |"
             )
         _write(args.output, "ann-sweep", {"dataset": dataset.name, "k": args.k, "rows": rows})
+        return 0
+    finally:
+        await embedder.aclose()
+        await pool.close()
+
+
+async def cmd_tune_fusion(args: argparse.Namespace, settings: Settings) -> int:
+    """Evaluates RRF keyword weights (vector weight 1.0) on a split other than the one reported.
+
+    Both candidate lists are retrieved once per query and fused for every weight, so the
+    sweep costs one retrieval per query regardless of the number of weights.
+    """
+    keyword_weights = [float(v) for v in args.weights.split(",")]
+    dataset = load_dataset(args.dataset, args.split)
+    pool = await open_pool(settings.database_url, max_size=4)
+    embedder = OpenAICompatibleEmbedder(settings)
+    try:
+        await _check_dimensions(pool, embedder.dimensions)
+        service = SearchService.from_settings(pool, embedder, settings)
+        retrieved = []
+        for query in dataset.queries:
+            keyword = await service.keyword(query.text, service.candidates)
+            vector = await service.vector(await embedder.embed_query(query.text), service.candidates)
+            retrieved.append((query, keyword, vector))
+
+        rows = []
+        for weight in keyword_weights:
+            ndcg, recall = 0.0, 0.0
+            for query, keyword, vector in retrieved:
+                fused = fuse(keyword, vector, 100, service.rrf_k, {"keyword": weight, "vector": 1.0})
+                ids = [doc.document_id for doc in fused]
+                ndcg += ndcg_at_k(ids, dataset.qrels[query.id], 10)
+                recall += recall_at_k(ids, dataset.qrels[query.id], 100)
+            count = len(retrieved)
+            rows.append(
+                {
+                    "keyword_weight": weight,
+                    "ndcg@10": round(ndcg / count, 4),
+                    "recall@100": round(recall / count, 4),
+                }
+            )
+
+        print(f"\n{dataset.name} ({args.split}), {len(dataset.queries)} queries, vector weight 1.0\n")
+        print("| Keyword weight | nDCG@10 | Recall@100 |")
+        print("| ---: | ---: | ---: |")
+        for row in rows:
+            print(f"| {row['keyword_weight']} | {row['ndcg@10']:.3f} | {row['recall@100']:.3f} |")
+        best = max(rows, key=lambda row: row["ndcg@10"])
+        print(f"\nbest keyword weight by nDCG@10: {best['keyword_weight']}")
+        _write(args.output, "tune-fusion", {"dataset": dataset.name, "split": args.split, "rows": rows})
         return 0
     finally:
         await embedder.aclose()
@@ -366,6 +428,13 @@ async def cmd_bench(args: argparse.Namespace, settings: Settings) -> int:
         )
     _write(args.output, "bench", report)
     return 0 if cold["errors"] == warm["errors"] == 0 else 1
+
+
+async def _vacuum(url: str) -> None:
+    from psycopg import AsyncConnection
+
+    async with await AsyncConnection.connect(url, autocommit=True) as conn:
+        await conn.execute("vacuum (analyze) chunks, chunk_terms")
 
 
 async def _check_dimensions(pool: Any, expected: int) -> None:

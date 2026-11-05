@@ -1,6 +1,6 @@
 # 0002. Use PostgreSQL full-text search with OR semantics for keyword retrieval
 
-- Status: Accepted
+- Status: Superseded by [0007](0007-bm25-in-postgresql.md)
 - Date: 2026-11-05
 
 ## Context
