@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import random
 import statistics
 import sys
@@ -22,7 +23,9 @@ from .evaluation.beir import CorpusDocument, iter_corpus, load_dataset, safe_ext
 from .evaluation.metrics import mrr_at_k, ndcg_at_k, percentile, recall_at_k
 from .ingest import Ingestor
 from .log import configure_logging
-from .search import SEARCH_MODES, SearchMode, SearchService, fuse
+from .providers import ProviderError
+from .reranker import OpenAICompatibleReranker
+from .search import SEARCH_MODES, SearchMode, SearchService, apply_rerank, fuse
 
 logger = logging.getLogger("hybrid_search.cli")
 
@@ -44,8 +47,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(result or 0)
     except KeyboardInterrupt:
         return 130
-    except EmbeddingError as error:
-        print(f"error: {error} ({settings.embedding_base_url})", file=sys.stderr)
+    except ProviderError as error:
+        url = settings.embedding_base_url if isinstance(error, EmbeddingError) else settings.rerank_base_url
+        print(f"error: {error} ({url})", file=sys.stderr)
         return 1
     except OperationalError as error:
         print(f"error: database unavailable: {error}".rstrip(), file=sys.stderr)
@@ -79,8 +83,17 @@ def _parser() -> argparse.ArgumentParser:
     command.add_argument("dataset", type=Path)
     command.add_argument("--split", default="test")
     command.add_argument("--modes", default=",".join(SEARCH_MODES))
+    command.add_argument("--rerank", action="store_true", help="also evaluate hybrid search with reranking")
     command.add_argument("--output", type=Path, default=Path("results"))
     command.set_defaults(handler=cmd_eval)
+
+    command = commands.add_parser("tune-rerank", help="hybrid quality with reranking for a range of weights")
+    command.add_argument("dataset", type=Path)
+    command.add_argument("--split", default="train")
+    command.add_argument("--queries", type=int, default=300, help="random sample of queries from the split")
+    command.add_argument("--weights", default="0,0.25,0.5,1,2,4,inf")
+    command.add_argument("--output", type=Path, default=Path("results"))
+    command.set_defaults(handler=cmd_tune_rerank)
 
     command = commands.add_parser("ann-sweep", help="HNSW recall and latency against exact search")
     command.add_argument("dataset", type=Path)
@@ -215,13 +228,18 @@ async def cmd_ingest_beir(args: argparse.Namespace, settings: Settings) -> int:
 
 
 async def cmd_eval(args: argparse.Namespace, settings: Settings) -> int:
-    modes: list[SearchMode] = [m for m in SEARCH_MODES if m in args.modes.split(",")]
+    runs: list[tuple[str, SearchMode, bool]] = [
+        (mode, mode, False) for mode in SEARCH_MODES if mode in args.modes.split(",")
+    ]
+    if args.rerank:
+        runs.append(("hybrid+rerank", "hybrid", True))
     dataset = load_dataset(args.dataset, args.split)
     pool = await open_pool(settings.database_url, max_size=4)
     embedder = OpenAICompatibleEmbedder(settings)
+    reranker = _reranker(settings) if args.rerank else None
     try:
         await _check_dimensions(pool, embedder.dimensions)
-        service = SearchService.from_settings(pool, embedder, settings)
+        service = SearchService.from_settings(pool, embedder, settings, reranker)
 
         # Query embeddings are computed once up front, so retrieval latency is measured
         # separately from the embedding call and is comparable across modes.
@@ -239,12 +257,18 @@ async def cmd_eval(args: argparse.Namespace, settings: Settings) -> int:
             "query_embedding_ms": _latency(embedding_ms),
             "modes": {},
         }
-        for mode in modes:
+        if reranker is not None:
+            report["rerank"] = {
+                "model": reranker.model,
+                "depth": service.rerank_depth,
+                "weight": service.rerank_weight,
+            }
+        for label, mode, rerank in runs:
             totals = {"ndcg@10": 0.0, "recall@10": 0.0, "recall@100": 0.0, "mrr@10": 0.0}
             latencies = []
             for query in dataset.queries:
                 started = time.perf_counter()
-                ranked = await service.rank(query.text, mode, 100)
+                ranked = await service.rank(query.text, mode, 100, rerank)
                 latencies.append((time.perf_counter() - started) * 1000)
                 ids = [doc.document_id for doc in ranked]
                 relevant = dataset.qrels[query.id]
@@ -253,7 +277,7 @@ async def cmd_eval(args: argparse.Namespace, settings: Settings) -> int:
                 totals["recall@100"] += recall_at_k(ids, relevant, 100)
                 totals["mrr@10"] += mrr_at_k(ids, relevant, 10)
             count = len(dataset.queries)
-            report["modes"][mode] = {
+            report["modes"][label] = {
                 **{name: round(total / count, 4) for name, total in totals.items()},
                 "latency_ms": _latency(latencies),
             }
@@ -267,10 +291,90 @@ async def cmd_eval(args: argparse.Namespace, settings: Settings) -> int:
                 f"| {row['mrr@10']:.3f} | {row['latency_ms']['p50']:.1f} | {row['latency_ms']['p95']:.1f} |"
             )
         print(f"\nQuery embedding: p50 {report['query_embedding_ms']['p50']:.1f} ms, not included above")
+        if reranker is not None:
+            print(
+                f"Reranking: {reranker.model}, top {service.rerank_depth}, weight {service.rerank_weight}; "
+                "its latency is included above"
+            )
         _write(args.output, "eval", report)
         return 0
     finally:
         await embedder.aclose()
+        if reranker is not None:
+            await reranker.aclose()
+        await pool.close()
+
+
+async def cmd_tune_rerank(args: argparse.Namespace, settings: Settings) -> int:
+    """Evaluates reranking weights on a split other than the one reported.
+
+    Each query is retrieved and reranked once; every weight is then applied to the same
+    scores, so the sweep costs one reranker call per query regardless of the number of
+    weights.
+    """
+    weights = [float(v) for v in args.weights.split(",")]
+    dataset = load_dataset(args.dataset, args.split)
+    queries = list(dataset.queries)
+    if args.queries < len(queries):
+        queries = random.Random(7).sample(queries, args.queries)
+    pool = await open_pool(settings.database_url, max_size=4)
+    embedder = OpenAICompatibleEmbedder(settings)
+    reranker = _reranker(settings)
+    try:
+        await _check_dimensions(pool, embedder.dimensions)
+        service = SearchService.from_settings(pool, embedder, settings, reranker)
+        depth = service.rerank_depth
+        scored = []
+        rerank_ms = []
+        for index, query in enumerate(queries, start=1):
+            ranked = await service.rank(query.text, "hybrid", 100)
+            started = time.perf_counter()
+            scores = await service.rerank_scores(query.text, ranked[:depth])
+            rerank_ms.append((time.perf_counter() - started) * 1000)
+            scored.append((query, ranked, scores))
+            if index % 25 == 0 or index == len(queries):
+                print(f"{index}/{len(queries)} queries reranked", flush=True)
+
+        rows = []
+        for weight in weights:
+            ndcg, recall = 0.0, 0.0
+            for query, ranked, scores in scored:
+                ids = [doc.document_id for doc in apply_rerank(ranked, scores, weight, service.rrf_k)]
+                ndcg += ndcg_at_k(ids, dataset.qrels[query.id], 10)
+                recall += recall_at_k(ids, dataset.qrels[query.id], 10)
+            rows.append(
+                {
+                    "rerank_weight": weight,
+                    "ndcg@10": round(ndcg / len(scored), 4),
+                    "recall@10": round(recall / len(scored), 4),
+                }
+            )
+
+        print(f"\n{dataset.name} ({args.split}), {len(scored)} queries, {reranker.model}, top {depth}\n")
+        print("| Rerank weight | nDCG@10 | Recall@10 |")
+        print("| ---: | ---: | ---: |")
+        for row in rows:
+            label = "reranker order" if math.isinf(row["rerank_weight"]) else row["rerank_weight"]
+            print(f"| {label} | {row['ndcg@10']:.3f} | {row['recall@10']:.3f} |")
+        print(f"\nReranking latency for {depth} documents: p50 {percentile(rerank_ms, 50):.0f} ms")
+        best = max(rows, key=lambda row: row["ndcg@10"])
+        print(f"best weight by nDCG@10: {best['rerank_weight']}")
+        _write(
+            args.output,
+            "tune-rerank",
+            {
+                "dataset": dataset.name,
+                "split": args.split,
+                "model": reranker.model,
+                "depth": depth,
+                "rerank_ms": _latency(rerank_ms),
+                "rows": rows,
+            },
+        )
+        return 0
+    finally:
+        await embedder.aclose()
+        await reranker.aclose()
         await pool.close()
 
 
@@ -436,6 +540,17 @@ async def cmd_bench(args: argparse.Namespace, settings: Settings) -> int:
         )
     _write(args.output, "bench", report)
     return 0 if cold["errors"] == warm["errors"] == 0 else 1
+
+
+def _reranker(settings: Settings) -> OpenAICompatibleReranker:
+    if not settings.rerank_base_url:
+        raise SystemExit("reranking needs RERANK_BASE_URL, for example http://127.0.0.1:8082/v1")
+    return OpenAICompatibleReranker(
+        settings.rerank_base_url,
+        settings.rerank_model,
+        settings.rerank_api_key,
+        settings.embedding_timeout_seconds,
+    )
 
 
 async def _vacuum(url: str) -> None:

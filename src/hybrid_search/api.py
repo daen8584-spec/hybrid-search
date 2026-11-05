@@ -15,9 +15,11 @@ from pydantic import BaseModel, Field
 
 from .config import Settings
 from .db import embedding_dimensions, open_pool
-from .embeddings import Embedder, EmbeddingError, OpenAICompatibleEmbedder
+from .embeddings import Embedder, OpenAICompatibleEmbedder
 from .ingest import Ingestor, IngestStatus
 from .log import configure_logging, request_id
+from .providers import ProviderError
+from .reranker import OpenAICompatibleReranker, Reranker
 from .search import SearchMode, SearchService
 
 logger = logging.getLogger("hybrid_search.api")
@@ -46,16 +48,22 @@ class Hit(BaseModel):
     score: float
     keyword_rank: int | None
     vector_rank: int | None
+    rerank_rank: int | None = None
 
 
 class SearchOut(BaseModel):
     query: str
     mode: SearchMode
+    reranked: bool
     took_ms: float
     results: list[Hit]
 
 
-def create_app(settings: Settings | None = None, embedder: Embedder | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    embedder: Embedder | None = None,
+    reranker: Reranker | None = None,
+) -> FastAPI:
     settings = settings or Settings.from_env()
 
     @asynccontextmanager
@@ -64,6 +72,15 @@ def create_app(settings: Settings | None = None, embedder: Embedder | None = Non
         pool = await open_pool(settings.database_url)
         owned = embedder is None
         active: Embedder = embedder or OpenAICompatibleEmbedder(settings)
+        owned_reranker = reranker is None and settings.rerank_base_url is not None
+        active_reranker: Reranker | None = reranker
+        if owned_reranker and settings.rerank_base_url:
+            active_reranker = OpenAICompatibleReranker(
+                settings.rerank_base_url,
+                settings.rerank_model,
+                settings.rerank_api_key,
+                settings.embedding_timeout_seconds,
+            )
         try:
             async with pool.connection() as conn:
                 declared = await embedding_dimensions(conn)
@@ -76,11 +93,13 @@ def create_app(settings: Settings | None = None, embedder: Embedder | None = Non
             app.state.ingestor = Ingestor(
                 pool, active, settings.chunk_max_tokens, settings.chunk_overlap_tokens
             )
-            app.state.search = SearchService.from_settings(pool, active, settings)
+            app.state.search = SearchService.from_settings(pool, active, settings, active_reranker)
             yield
         finally:
             if owned and isinstance(active, OpenAICompatibleEmbedder):
                 await active.aclose()
+            if owned_reranker and isinstance(active_reranker, OpenAICompatibleReranker):
+                await active_reranker.aclose()
             await pool.close()
 
     app = FastAPI(title="hybrid-search", version="0.1.0", lifespan=lifespan)
@@ -111,11 +130,11 @@ def create_app(settings: Settings | None = None, embedder: Embedder | None = Non
         request_id.reset(token)
         return response
 
-    @app.exception_handler(EmbeddingError)
-    async def embedding_failed(request: Request, error: EmbeddingError) -> JSONResponse:
-        logger.error("embedding provider error", extra={"detail": str(error)})
+    @app.exception_handler(ProviderError)
+    async def provider_failed(request: Request, error: ProviderError) -> JSONResponse:
+        logger.error(f"{error.kind} provider error", extra={"detail": str(error)})
         return JSONResponse(
-            {"detail": "embedding provider unavailable"}, status_code=status.HTTP_502_BAD_GATEWAY
+            {"detail": f"{error.kind} provider unavailable"}, status_code=status.HTTP_502_BAD_GATEWAY
         )
 
     @app.get("/health")
@@ -153,12 +172,17 @@ def create_app(settings: Settings | None = None, embedder: Embedder | None = Non
         q: Annotated[str, Query(min_length=1, max_length=1_000)],
         mode: SearchMode = "hybrid",
         limit: Annotated[int, Query(ge=1, le=50)] = 10,
+        rerank: bool = False,
     ) -> SearchOut:
+        service: SearchService = request.app.state.search
+        if rerank and service.reranker is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "reranking is not configured")
         started = time.perf_counter()
-        hits = await request.app.state.search.search(q, mode, limit)
+        hits = await service.search(q, mode, limit, rerank)
         return SearchOut(
             query=q,
             mode=mode,
+            reranked=rerank,
             took_ms=round((time.perf_counter() - started) * 1000, 2),
             results=[
                 Hit(
@@ -168,6 +192,7 @@ def create_app(settings: Settings | None = None, embedder: Embedder | None = Non
                     score=h.score,
                     keyword_rank=h.keyword_rank,
                     vector_rank=h.vector_rank,
+                    rerank_rank=h.rerank_rank,
                 )
                 for h in hits
             ],

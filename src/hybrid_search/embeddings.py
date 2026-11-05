@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import logging
 from collections import OrderedDict
 from collections.abc import Sequence
 from typing import Protocol
@@ -11,14 +9,13 @@ from typing import Protocol
 import httpx
 
 from .config import Settings
-
-logger = logging.getLogger(__name__)
-
-RETRYABLE_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504})
+from .providers import ProviderError, post_json
 
 
-class EmbeddingError(Exception):
+class EmbeddingError(ProviderError):
     """The embedding provider failed or returned an unusable response."""
+
+    kind = "embedding"
 
 
 class Embedder(Protocol):
@@ -75,28 +72,11 @@ class OpenAICompatibleEmbedder:
 
     async def _embed(self, inputs: list[str]) -> list[list[float]]:
         url = self._settings.embedding_base_url.rstrip("/") + "/embeddings"
-        headers = (
-            {"Authorization": f"Bearer {self._settings.embedding_api_key}"}
-            if self._settings.embedding_api_key
-            else {}
-        )
         payload = {"model": self.model, "input": inputs}
-
-        for attempt in range(1, self._max_attempts + 1):
-            try:
-                response = await self._client.post(url, json=payload, headers=headers)
-            except httpx.TransportError as error:
-                if attempt == self._max_attempts:
-                    raise EmbeddingError(f"embedding request failed: {error}") from error
-            else:
-                if response.status_code == 200:
-                    return self._parse(response, expected=len(inputs))
-                if response.status_code not in RETRYABLE_STATUS or attempt == self._max_attempts:
-                    raise EmbeddingError(f"embedding provider returned HTTP {response.status_code}")
-            delay = 0.5 * 2 ** (attempt - 1)
-            logger.warning("embedding request failed, retrying", extra={"attempt": attempt, "delay_s": delay})
-            await asyncio.sleep(delay)
-        raise AssertionError("unreachable")
+        response = await post_json(
+            self._client, url, payload, self._settings.embedding_api_key, EmbeddingError, self._max_attempts
+        )
+        return self._parse(response, expected=len(inputs))
 
     def _parse(self, response: httpx.Response, expected: int) -> list[list[float]]:
         try:

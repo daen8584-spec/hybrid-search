@@ -53,6 +53,11 @@ class Settings:
     chunk_overlap_tokens: int
     hnsw_ef_search: int
     fusion_keyword_weight: float
+    rerank_base_url: str | None
+    rerank_model: str
+    rerank_api_key: str | None
+    rerank_depth: int
+    rerank_weight: float
     log_level: str
 
     @classmethod
@@ -72,5 +77,10 @@ class Settings:
             chunk_overlap_tokens=_int("CHUNK_OVERLAP_TOKENS", 48),
             hnsw_ef_search=_int("HNSW_EF_SEARCH", 40),
             fusion_keyword_weight=_float("FUSION_KEYWORD_WEIGHT", 1.0),
+            rerank_base_url=env.get("RERANK_BASE_URL") or None,
+            rerank_model=env.get("RERANK_MODEL", "jina-reranker-v1-turbo-en"),
+            rerank_api_key=env.get("RERANK_API_KEY") or None,
+            rerank_depth=_int("RERANK_DEPTH", 20),
+            rerank_weight=_float("RERANK_WEIGHT", 1.0),
             log_level=env.get("LOG_LEVEL", "INFO").upper(),
         )

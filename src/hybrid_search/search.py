@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
 from .db import to_vector_literal
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
 
     from .config import Settings
     from .embeddings import Embedder
+    from .reranker import Reranker
 
 SearchMode = Literal["keyword", "vector", "hybrid"]
 SEARCH_MODES: tuple[SearchMode, ...] = ("keyword", "vector", "hybrid")
@@ -105,6 +107,7 @@ class RankedDocument:
     score: float
     keyword_rank: int | None
     vector_rank: int | None
+    rerank_rank: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +118,7 @@ class SearchHit:
     score: float
     keyword_rank: int | None
     vector_rank: int | None
+    rerank_rank: int | None = None
 
 
 class SearchService:
@@ -131,6 +135,9 @@ class SearchService:
         max_df_fraction: float = 0.1,
         min_candidates: int = 1_000,
         stats_ttl_seconds: float = 60.0,
+        reranker: Reranker | None = None,
+        rerank_depth: int = 20,
+        rerank_weight: float = 1.0,
     ) -> None:
         self._pool = pool
         self._embedder = embedder
@@ -144,16 +151,26 @@ class SearchService:
         self.min_candidates = min_candidates
         self._stats_ttl = stats_ttl_seconds
         self._stats: tuple[float, CorpusStats] | None = None
+        self.reranker = reranker
+        self.rerank_depth = rerank_depth
+        self.rerank_weight = rerank_weight
 
     @classmethod
     def from_settings(
-        cls, pool: AsyncConnectionPool, embedder: Embedder, settings: Settings
+        cls,
+        pool: AsyncConnectionPool,
+        embedder: Embedder,
+        settings: Settings,
+        reranker: Reranker | None = None,
     ) -> SearchService:
         return cls(
             pool,
             embedder,
             ef_search=settings.hnsw_ef_search,
             weights={"keyword": settings.fusion_keyword_weight, "vector": 1.0},
+            reranker=reranker,
+            rerank_depth=settings.rerank_depth,
+            rerank_weight=settings.rerank_weight,
         )
 
     async def corpus_stats(self) -> CorpusStats:
@@ -222,7 +239,32 @@ class SearchService:
             rows = await cursor.fetchall()
         return [Candidate(document_id, chunk_id, float(score)) for document_id, chunk_id, score in rows]
 
-    async def rank(self, query: str, mode: SearchMode, limit: int) -> list[RankedDocument]:
+    async def rank(
+        self, query: str, mode: SearchMode, limit: int, rerank: bool = False
+    ) -> list[RankedDocument]:
+        """Ranks documents for a query. With rerank=True, the top `rerank_depth` results of
+        the chosen mode are rescored by the reranker and combined with their first-stage
+        ranks (see apply_rerank)."""
+        depth = max(limit, self.rerank_depth) if rerank else limit
+        ranked = await self._first_stage(query, mode, depth)
+        if not rerank:
+            return ranked
+        if self.reranker is None:
+            raise ValueError("reranking is not configured")
+        scores = await self.rerank_scores(query, ranked[: self.rerank_depth])
+        return apply_rerank(ranked, scores, self.rerank_weight, self.rrf_k)[:limit]
+
+    async def rerank_scores(self, query: str, ranked: Sequence[RankedDocument]) -> list[float]:
+        """Reranker scores for the given documents, from the chunk each was ranked by."""
+        assert self.reranker is not None
+        texts = await self._chunk_texts([doc.chunk_id for doc in ranked])
+        documents = []
+        for doc in ranked:
+            title, content = texts.get(doc.chunk_id, ("", ""))
+            documents.append(f"{title}\n\n{content}" if title else content)
+        return await self.reranker.score(query, documents)
+
+    async def _first_stage(self, query: str, mode: SearchMode, limit: int) -> list[RankedDocument]:
         if mode == "keyword":
             return _single(await self.keyword(query, limit), "keyword")
         if mode == "vector":
@@ -234,10 +276,9 @@ class SearchService:
         )
         return fuse(keyword, vector, limit, self.rrf_k, self.weights)
 
-    async def search(self, query: str, mode: SearchMode, limit: int) -> list[SearchHit]:
-        ranked = await self.rank(query, mode, limit)
-        if not ranked:
-            return []
+    async def _chunk_texts(self, chunk_ids: Sequence[int]) -> dict[int, tuple[str, str]]:
+        if not chunk_ids:
+            return {}
         async with self._pool.connection() as conn:
             cursor = await conn.execute(
                 """
@@ -245,10 +286,13 @@ class SearchService:
                 from chunks c join documents d on d.id = c.document_id
                 where c.id = any(%s)
                 """,
-                ([doc.chunk_id for doc in ranked],),
+                (list(chunk_ids),),
             )
-            details = {chunk_id: (title, content) for chunk_id, title, content in await cursor.fetchall()}
+            return {chunk_id: (title, content) for chunk_id, title, content in await cursor.fetchall()}
 
+    async def search(self, query: str, mode: SearchMode, limit: int, rerank: bool = False) -> list[SearchHit]:
+        ranked = await self.rank(query, mode, limit, rerank)
+        details = await self._chunk_texts([doc.chunk_id for doc in ranked])
         hits = []
         for doc in ranked:
             # A document deleted between ranking and this lookup is skipped.
@@ -257,7 +301,13 @@ class SearchService:
             title, content = details[doc.chunk_id]
             hits.append(
                 SearchHit(
-                    doc.document_id, title, snippet(content), doc.score, doc.keyword_rank, doc.vector_rank
+                    doc.document_id,
+                    title,
+                    snippet(content),
+                    doc.score,
+                    doc.keyword_rank,
+                    doc.vector_rank,
+                    doc.rerank_rank,
                 )
             )
         return hits
@@ -295,6 +345,50 @@ def fuse(
             vector_rank.get(document_id),
         )
         for document_id, score in fused[:limit]
+    ]
+
+
+def apply_rerank(
+    ranked: Sequence[RankedDocument],
+    scores: Sequence[float],
+    weight: float,
+    rrf_k: int = 60,
+) -> list[RankedDocument]:
+    """Combines a first-stage ranking with reranker scores for its first len(scores) documents.
+
+    The reranker's order is fused with the first-stage order by RRF, with the reranker's
+    ranking weighted by `weight` relative to the first stage. A weight of 0 keeps the
+    first-stage order, and an infinite weight uses the reranker's order for the reranked
+    documents, followed by the rest in their original order. Fusing instead of replacing
+    keeps a weak reranker from discarding a strong first-stage ranking; the right weight
+    is measured with `hybrid-search tune-rerank`.
+    """
+    depth = len(scores)
+    head = list(ranked[:depth])
+    order = sorted(range(depth), key=lambda i: scores[i], reverse=True)
+    rerank_rank = {head[i].document_id: position for position, i in enumerate(order, start=1)}
+
+    if math.isinf(weight):
+        reordered = [head[i] for i in order] + list(ranked[depth:])
+        fused_scores = {
+            doc.document_id: float(len(reordered) - position) for position, doc in enumerate(reordered)
+        }
+    else:
+        fused = reciprocal_rank_fusion(
+            {
+                "first_stage": [doc.document_id for doc in ranked],
+                "rerank": [head[i].document_id for i in order],
+            },
+            weights={"first_stage": 1.0, "rerank": weight},
+            k=rrf_k,
+        )
+        fused_scores = dict(fused)
+        by_id = {doc.document_id: doc for doc in ranked}
+        reordered = [by_id[document_id] for document_id, _ in fused]
+
+    return [
+        replace(doc, score=fused_scores[doc.document_id], rerank_rank=rerank_rank.get(doc.document_id))
+        for doc in reordered
     ]
 
 

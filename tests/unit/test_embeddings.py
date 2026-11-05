@@ -27,6 +27,11 @@ def settings(**overrides: object) -> Settings:
         "chunk_overlap_tokens": 48,
         "hnsw_ef_search": 40,
         "fusion_keyword_weight": 1.0,
+        "rerank_base_url": None,
+        "rerank_model": "test-reranker",
+        "rerank_api_key": None,
+        "rerank_depth": 20,
+        "rerank_weight": 1.0,
         "log_level": "INFO",
     }
     values.update(overrides)
@@ -50,7 +55,7 @@ def no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     async def instant(_: float) -> None:
         return None
 
-    monkeypatch.setattr("hybrid_search.embeddings.asyncio.sleep", instant)
+    monkeypatch.setattr("hybrid_search.providers.asyncio.sleep", instant)
 
 
 async def test_documents_are_batched_prefixed_and_kept_in_order() -> None:

@@ -9,7 +9,7 @@ from hybrid_search.api import create_app
 from hybrid_search.config import Settings
 from hybrid_search.embeddings import EmbeddingError
 
-from .conftest import HashingEmbedder
+from .conftest import HashingEmbedder, TermOverlapReranker
 
 pytestmark = pytest.mark.integration
 
@@ -24,11 +24,14 @@ class FailingEmbedder(HashingEmbedder):
         raise EmbeddingError("provider is down")
 
 
-def open_client(database_url: str, embedder: HashingEmbedder) -> TestClient:
+def open_client(
+    database_url: str, embedder: HashingEmbedder, reranker: TermOverlapReranker | None = None
+) -> TestClient:
     with psycopg.connect(database_url, autocommit=True) as conn:
         conn.execute("truncate documents, chunks restart identity cascade")
-    settings = dataclasses.replace(Settings.from_env(), database_url=database_url)
-    return TestClient(create_app(settings, embedder=embedder))
+    # A reranker configured in .env must not leak into tests that expect none.
+    settings = dataclasses.replace(Settings.from_env(), database_url=database_url, rerank_base_url=None)
+    return TestClient(create_app(settings, embedder=embedder, reranker=reranker))
 
 
 @pytest.fixture
@@ -99,3 +102,24 @@ def test_embedding_failures_return_bad_gateway(database_url: str) -> None:
         assert response.json() == {"detail": "embedding provider unavailable"}
         # keyword search does not depend on the embedding provider
         assert client.get("/search", params={"q": "aspirin", "mode": "keyword"}).status_code == 200
+
+
+def test_rerank_is_rejected_when_no_reranker_is_configured(client: TestClient) -> None:
+    response = client.get("/search", params={"q": "aspirin", "rerank": "true"})
+    assert response.status_code == 400
+    assert response.json() == {"detail": "reranking is not configured"}
+
+
+def test_search_with_reranking_reports_the_rerank_rank(database_url: str) -> None:
+    with open_client(database_url, HashingEmbedder(), TermOverlapReranker()) as client:
+        client.put("/documents/aspirin", json=DOCUMENT)
+        client.put("/documents/sleep", json={"title": "Sleep", "text": "Sleep deprivation impairs memory."})
+
+        body = client.get("/search", params={"q": "aspirin fever", "rerank": "true"}).json()
+
+        assert body["reranked"] is True
+        assert body["results"][0]["id"] == "aspirin"
+        assert body["results"][0]["rerank_rank"] == 1
+        plain = client.get("/search", params={"q": "aspirin fever"}).json()
+        assert plain["reranked"] is False
+        assert plain["results"][0]["rerank_rank"] is None

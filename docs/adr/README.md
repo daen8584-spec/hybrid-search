@@ -11,3 +11,4 @@ Each record describes a significant design decision, the context that led to it 
 | [0005](0005-hnsw-index.md) | Use an HNSW index and measure its recall against exact search |
 | [0006](0006-synchronous-ingestion.md) | Ingest synchronously and reuse embeddings by content hash |
 | [0007](0007-bm25-in-postgresql.md) | Rank keyword results with BM25 over an inverted index in PostgreSQL |
+| [0008](0008-reranking.md) | Rerank the top hybrid results with a cross-encoder, fused by rank |

@@ -52,6 +52,21 @@ class HashingEmbedder:
         return [v / norm for v in vector]
 
 
+class TermOverlapReranker:
+    """Scores a document by how many distinct query words it contains, so tests can
+    predict the reranked order."""
+
+    model = "term-overlap-test-reranker"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, list[str]]] = []
+
+    async def score(self, query: str, documents: Sequence[str]) -> list[float]:
+        self.calls.append((query, list(documents)))
+        words = set(re.findall(r"\w+", query.lower()))
+        return [float(len(words & set(re.findall(r"\w+", d.lower())))) for d in documents]
+
+
 def resolve_test_database_url() -> str:
     load_dotenv()
     main = os.environ.get("DATABASE_URL", "postgresql:///hybrid_search")

@@ -1,4 +1,5 @@
 import asyncio
+import math
 
 import pytest
 from psycopg import AsyncConnection
@@ -8,7 +9,7 @@ from hybrid_search.db import embedding_dimensions, migrate
 from hybrid_search.ingest import Ingestor
 from hybrid_search.search import SearchService
 
-from .conftest import DIMENSIONS, HashingEmbedder
+from .conftest import DIMENSIONS, HashingEmbedder, TermOverlapReranker
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
@@ -195,3 +196,37 @@ async def test_keyword_search_on_an_empty_corpus(
     pool: AsyncConnectionPool, embedder: HashingEmbedder
 ) -> None:
     assert await SearchService(pool, embedder).rank("anything", "keyword", 10) == []
+
+
+async def test_reranking_scores_the_top_candidates_by_title_and_text(
+    pool: AsyncConnectionPool, embedder: HashingEmbedder
+) -> None:
+    texts = {"aspirin": ("Aspirin", ASPIRIN), "vitamin": ("Vitamin D", VITAMIN), "sleep": ("Sleep", SLEEP)}
+    ingestor = Ingestor(pool, embedder)
+    for document_id, (title, text) in texts.items():
+        await ingestor.upsert(document_id, title, text)
+    reranker = TermOverlapReranker()
+    service = SearchService(
+        pool, embedder, candidates=10, reranker=reranker, rerank_depth=2, rerank_weight=math.inf
+    )
+    query = "aspirin and bone density in older adults"
+
+    plain = await service.rank(query, "hybrid", 3)
+    reranked = await service.rank(query, "hybrid", 3, rerank=True)
+
+    # Only the top two first-stage results are sent, each as its title and chunk text.
+    [(sent_query, documents)] = reranker.calls
+    assert sent_query == query
+    expected = [f"{texts[d.document_id][0]}\n\n{texts[d.document_id][1]}" for d in plain[:2]]
+    assert sorted(documents) == sorted(expected)
+    # The vitamin abstract shares the most query words, so the reranker puts it first,
+    # and the document beyond the rerank depth keeps its place without a rerank rank.
+    assert reranked[0].document_id == "vitamin"
+    assert reranked[0].rerank_rank == 1
+    assert reranked[2].document_id == plain[2].document_id
+    assert reranked[2].rerank_rank is None
+
+
+async def test_reranking_requires_a_reranker(corpus: SearchService) -> None:
+    with pytest.raises(ValueError, match="not configured"):
+        await corpus.rank("aspirin", "hybrid", 3, rerank=True)

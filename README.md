@@ -13,6 +13,7 @@ A retrieval service that combines BM25 keyword search with pgvector similarity s
 - **Any OpenAI-compatible embedding provider**, including a local `llama-server`, with batching, retries, response validation and a query embedding cache
 - **Evaluation** on BEIR datasets with nDCG@10, Recall@10, Recall@100 and MRR@10, and latency measured separately from the embedding call
 - **Tuning** of HNSW `ef_search` against exact search, and of the fusion weights on a separate query split
+- **Optional reranking** of the top results with a cross-encoder, combined with the first-stage ranking by rank fusion and tuned on a separate query split
 - **Load testing** of the HTTP API with p50, p95 and p99 latency and throughput
 - **Observability** through JSON logs with request ids and per-request timing
 - **Tested** with unit tests and integration tests against PostgreSQL with pgvector in CI, with strict type checking
@@ -114,6 +115,7 @@ Significant decisions are documented as [Architecture Decision Records](docs/adr
 - [0004](docs/adr/0004-embedding-model.md) An OpenAI-compatible embedding client and a fixed vector dimension
 - [0005](docs/adr/0005-hnsw-index.md) An HNSW index whose recall is measured against exact search
 - [0006](docs/adr/0006-synchronous-ingestion.md) Synchronous ingestion with embedding reuse
+- [0008](docs/adr/0008-reranking.md) Optional cross-encoder reranking fused with the first-stage ranking
 
 ## API
 
@@ -123,7 +125,7 @@ Errors are returned as `{"detail": ...}`. Every response carries an `x-request-i
 | --- | --- | --- |
 | `PUT` | `/documents/{id}` | Create or replace a document: `{"title": "...", "text": "...", "metadata": {}}`. Returns `201` when created and `200` otherwise, with the chunk counts |
 | `DELETE` | `/documents/{id}` | Delete a document and its chunks (`204`, or `404` if it does not exist) |
-| `GET` | `/search?q=...&mode=hybrid&limit=10` | Search with `mode` set to `keyword`, `vector` or `hybrid` and `limit` between 1 and 50 |
+| `GET` | `/search?q=...&mode=hybrid&limit=10&rerank=false` | Search with `mode` set to `keyword`, `vector` or `hybrid` and `limit` between 1 and 50. `rerank=true` adds the reranking stage, when configured, and each result then reports its `rerank_rank` |
 | `GET` | `/health` | Database connectivity check |
 
 ```bash
@@ -194,6 +196,10 @@ hybrid-search serve --port 8000
 | `CHUNK_MAX_TOKENS`, `CHUNK_OVERLAP_TOKENS` | `384`, `48` | Chunk size and overlap, in approximate tokens |
 | `HNSW_EF_SEARCH` | `40` | HNSW candidate list size per query; see `ann-sweep` |
 | `FUSION_KEYWORD_WEIGHT` | `1.0` | Weight of the keyword ranking in fusion, relative to the vector ranking; see `tune-fusion` |
+| `RERANK_BASE_URL` | none | Base URL of a `/rerank` endpoint; reranking is disabled without it |
+| `RERANK_MODEL`, `RERANK_API_KEY` | `jina-reranker-v1-turbo-en`, none | Reranking model and optional bearer token |
+| `RERANK_DEPTH` | `20` | Number of top results sent to the reranker |
+| `RERANK_WEIGHT` | `1.0` | Weight of the reranker's ranking relative to the first stage; `inf` uses the reranker's order; see `tune-rerank` |
 | `LOG_LEVEL` | `INFO` | Log level |
 
 ## Evaluation
@@ -209,6 +215,17 @@ hybrid-search tune-fusion data/scifact --split train
 ```
 
 `ingest-beir` is resumable: documents that are already stored with the same content are skipped. `eval` embeds every query first and then measures retrieval latency per mode with warm query embeddings, so the modes are compared on retrieval cost alone; the embedding latency is reported separately. `ann-sweep` compares HNSW results with exact search for each `ef_search` value. `tune-fusion` evaluates hybrid search for a range of keyword weights on the train split, so that the weight is chosen without looking at the test queries. Every command prints a Markdown table and writes the full results as JSON to `results/`, which is not committed.
+
+To add the reranking stage, serve a reranker with llama.cpp and point the service at it:
+
+```bash
+llama-server -hf ggml-org/jina-reranker-v1-turbo-en-GGUF --reranking --port 8082 -c 4096 -b 4096 -ub 4096
+export RERANK_BASE_URL=http://127.0.0.1:8082/v1
+hybrid-search tune-rerank data/scifact --split train --queries 300
+hybrid-search eval data/scifact --rerank
+```
+
+`tune-rerank` retrieves and reranks a sample of train queries once and evaluates every weight on the same scores. `eval --rerank` adds a reranked hybrid row to the test results, with the reranker's latency included.
 
 To load test the running API:
 
