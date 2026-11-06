@@ -35,7 +35,7 @@ class OpenAICompatibleEmbedder:
         settings: Settings,
         client: httpx.AsyncClient | None = None,
         max_attempts: int = 3,
-        query_cache_size: int = 2048,
+        query_cache_size: int | None = None,
     ) -> None:
         self.model = settings.embedding_model
         self.dimensions = settings.embedding_dimensions
@@ -43,7 +43,12 @@ class OpenAICompatibleEmbedder:
         self._max_attempts = max_attempts
         self._client = client or httpx.AsyncClient(timeout=settings.embedding_timeout_seconds)
         self._query_cache: OrderedDict[str, list[float]] = OrderedDict()
-        self._query_cache_size = query_cache_size
+        # Least recently used queries are evicted first. Size it above the number of
+        # distinct queries that repeat, or a repeated pass in order evicts every entry
+        # before it is reused.
+        self._query_cache_size = (
+            settings.embedding_query_cache_size if query_cache_size is None else query_cache_size
+        )
         self.prompt_tokens = 0
         self.cache_hits = 0
 

@@ -11,7 +11,6 @@ staying within embedding model context limits without depending on a specific to
 
 from __future__ import annotations
 
-import hashlib
 import re
 from dataclasses import dataclass
 from itertools import pairwise
@@ -27,10 +26,6 @@ class Chunk:
     ordinal: int
     text: str
     token_count: int
-
-    @property
-    def content_hash(self) -> str:
-        return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

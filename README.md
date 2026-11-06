@@ -116,7 +116,7 @@ flowchart LR
 
 Documents are split into chunks along paragraph and sentence boundaries, with overlap between consecutive chunks. Each chunk stores its text, its lexemes (from PostgreSQL's English text search configuration) in an inverted index with term frequencies, and the embedding of the title and chunk text.
 
-A hybrid query runs the keyword search and the vector search concurrently. Each returns its best 100 documents, ranked by their best chunk, and the two lists are fused by rank:
+A hybrid query runs the keyword search and the vector search concurrently. Each returns its best 100 documents, ranked by their best chunk, and the two lists are fused by rank. The vector search first takes twice as many nearest chunks as documents requested; when those belong to too few documents, it repeats with more chunks, up to 32 per requested document. A document is missed only when more than that many chunks rank above its best chunk. Fusion:
 
 ```
 score(d) = sum over retrievers r of  weight_r / (60 + rank_r(d))
@@ -158,6 +158,7 @@ Example response:
 {
   "query": "can aspirin prevent heart attacks",
   "mode": "hybrid",
+  "reranked": false,
   "took_ms": 12.4,
   "results": [
     {
@@ -166,7 +167,8 @@ Example response:
       "snippet": "Low dose aspirin reduces the risk of a second heart attack.",
       "score": 0.0328,
       "keyword_rank": 1,
-      "vector_rank": 1
+      "vector_rank": 1,
+      "rerank_rank": null
     }
   ]
 }
@@ -218,13 +220,17 @@ This starts the API, PostgreSQL with pgvector and `llama-server` with `nomic-emb
 | `EMBEDDING_DIMENSIONS` | `768` | Must match the `chunks.embedding` column |
 | `EMBEDDING_QUERY_PREFIX`, `EMBEDDING_DOCUMENT_PREFIX` | `search_query: `, `search_document: ` | Task prefixes for models trained with them |
 | `EMBEDDING_BATCH_SIZE` | `16` | Chunks per embedding request |
+| `EMBEDDING_TIMEOUT_SECONDS` | `60` | Timeout of each embedding request |
+| `EMBEDDING_QUERY_CACHE_SIZE` | `2048` | Query embeddings kept in memory, least recently used evicted first; `bench` needs at least as many as the dataset has queries for a warm second pass |
 | `CHUNK_MAX_TOKENS`, `CHUNK_OVERLAP_TOKENS` | `384`, `48` | Chunk size and overlap, in approximate tokens |
 | `HNSW_EF_SEARCH` | `40` | HNSW candidate list size per query; see `ann-sweep` |
 | `FUSION_KEYWORD_WEIGHT` | `1.0` | Weight of the keyword ranking in fusion, relative to the vector ranking; see `tune-fusion` |
+| `BM25_MAX_DF_FRACTION` | `0.1` | Terms in at most this fraction of chunks select keyword candidates; `1.0` scores every matching chunk ([0007](docs/adr/0007-bm25-in-postgresql.md)) |
 | `RERANK_BASE_URL` | none | Base URL of a `/rerank` endpoint; reranking is disabled without it |
 | `RERANK_MODEL`, `RERANK_API_KEY` | `jina-reranker-v1-turbo-en`, none | Reranking model and optional bearer token |
 | `RERANK_DEPTH` | `20` | Number of top results sent to the reranker |
 | `RERANK_WEIGHT` | `0.25` | Weight of the reranker's ranking relative to the first stage; `inf` uses the reranker's order; see `tune-rerank` |
+| `RERANK_TIMEOUT_SECONDS` | `60` | Timeout of each reranking request |
 | `LOG_LEVEL` | `INFO` | Log level |
 
 ## Evaluation
@@ -256,7 +262,7 @@ To load test the running API:
 
 ```bash
 hybrid-search serve --port 8000 &
-hybrid-search bench data/scifact --mode hybrid --concurrency 8
+hybrid-search bench data/scifact --mode hybrid --concurrency 4
 ```
 
 The benchmark sends every test query twice. The first pass includes the query embedding call; the second is served from the query embedding cache, which isolates the cost of retrieval and fusion.

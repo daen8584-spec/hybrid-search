@@ -29,6 +29,10 @@ def test_defaults_match_the_local_embedding_model(monkeypatch: pytest.MonkeyPatc
         "EMBEDDING_API_KEY",
         "HNSW_EF_SEARCH",
         "FUSION_KEYWORD_WEIGHT",
+        "EMBEDDING_QUERY_CACHE_SIZE",
+        "EMBEDDING_TIMEOUT_SECONDS",
+        "RERANK_TIMEOUT_SECONDS",
+        "BM25_MAX_DF_FRACTION",
     ):
         monkeypatch.delenv(name, raising=False)
     settings = Settings.from_env()
@@ -37,6 +41,17 @@ def test_defaults_match_the_local_embedding_model(monkeypatch: pytest.MonkeyPatc
     assert settings.embedding_api_key is None
     assert settings.hnsw_ef_search == 40
     assert settings.fusion_keyword_weight == 1.0
+    assert settings.embedding_query_cache_size == 2048
+    assert settings.rerank_timeout_seconds == 60.0
+    assert settings.bm25_max_df_fraction == 0.1
+
+
+def test_reranking_has_its_own_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EMBEDDING_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("RERANK_TIMEOUT_SECONDS", "5")
+    settings = Settings.from_env()
+    assert settings.embedding_timeout_seconds == 30.0
+    assert settings.rerank_timeout_seconds == 5.0
 
 
 def test_invalid_integers_name_the_variable(monkeypatch: pytest.MonkeyPatch) -> None:

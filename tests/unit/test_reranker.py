@@ -3,14 +3,14 @@ import json
 import httpx
 import pytest
 
-from hybrid_search.reranker import OpenAICompatibleReranker, RerankError
+from hybrid_search.reranker import HttpReranker, RerankError
 
 pytestmark = pytest.mark.anyio
 
 
-def reranker(handler, **options) -> OpenAICompatibleReranker:  # type: ignore[no-untyped-def]
+def reranker(handler, **options) -> HttpReranker:  # type: ignore[no-untyped-def]
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    return OpenAICompatibleReranker("http://rerank.test/v1", "test-reranker", client=client, **options)
+    return HttpReranker("http://rerank.test/v1", "test-reranker", client=client, **options)
 
 
 @pytest.fixture(autouse=True)

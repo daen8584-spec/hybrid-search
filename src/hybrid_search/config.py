@@ -49,6 +49,7 @@ class Settings:
     embedding_document_prefix: str
     embedding_batch_size: int
     embedding_timeout_seconds: float
+    embedding_query_cache_size: int
     chunk_max_tokens: int
     chunk_overlap_tokens: int
     hnsw_ef_search: int
@@ -58,6 +59,8 @@ class Settings:
     rerank_api_key: str | None
     rerank_depth: int
     rerank_weight: float
+    rerank_timeout_seconds: float
+    bm25_max_df_fraction: float
     log_level: str
 
     @classmethod
@@ -73,6 +76,7 @@ class Settings:
             embedding_document_prefix=env.get("EMBEDDING_DOCUMENT_PREFIX", "search_document: "),
             embedding_batch_size=_int("EMBEDDING_BATCH_SIZE", 16),
             embedding_timeout_seconds=_float("EMBEDDING_TIMEOUT_SECONDS", 60.0),
+            embedding_query_cache_size=_int("EMBEDDING_QUERY_CACHE_SIZE", 2048),
             chunk_max_tokens=_int("CHUNK_MAX_TOKENS", 384),
             chunk_overlap_tokens=_int("CHUNK_OVERLAP_TOKENS", 48),
             hnsw_ef_search=_int("HNSW_EF_SEARCH", 40),
@@ -82,5 +86,7 @@ class Settings:
             rerank_api_key=env.get("RERANK_API_KEY") or None,
             rerank_depth=_int("RERANK_DEPTH", 20),
             rerank_weight=_float("RERANK_WEIGHT", 0.25),
+            rerank_timeout_seconds=_float("RERANK_TIMEOUT_SECONDS", 60.0),
+            bm25_max_df_fraction=_float("BM25_MAX_DF_FRACTION", 0.1),
             log_level=env.get("LOG_LEVEL", "INFO").upper(),
         )

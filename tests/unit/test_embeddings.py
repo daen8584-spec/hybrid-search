@@ -23,6 +23,7 @@ def settings(**overrides: object) -> Settings:
         "embedding_document_prefix": "d: ",
         "embedding_batch_size": 2,
         "embedding_timeout_seconds": 5.0,
+        "embedding_query_cache_size": 2048,
         "chunk_max_tokens": 384,
         "chunk_overlap_tokens": 48,
         "hnsw_ef_search": 40,
@@ -32,6 +33,8 @@ def settings(**overrides: object) -> Settings:
         "rerank_api_key": None,
         "rerank_depth": 20,
         "rerank_weight": 1.0,
+        "rerank_timeout_seconds": 5.0,
+        "bm25_max_df_fraction": 0.1,
         "log_level": "INFO",
     }
     values.update(overrides)
@@ -90,6 +93,22 @@ async def test_query_embeddings_are_cached() -> None:
 
     assert first == second
     assert calls == 1
+    assert client.cache_hits == 1
+
+
+async def test_query_cache_size_comes_from_the_settings_and_evicts_least_recent() -> None:
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.extend(json.loads(request.content)["input"])
+        return vectors_for(request)
+
+    client = embedder(handler, embedding_query_cache_size=2)
+    for text in ("a", "b", "a", "c", "b"):
+        await client.embed_query(text)
+
+    # "a" was used after "b", so "b" is the one evicted when "c" arrives.
+    assert requested == ["q: a", "q: b", "q: c", "q: b"]
     assert client.cache_hits == 1
 
 

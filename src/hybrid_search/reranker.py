@@ -32,7 +32,14 @@ class Reranker(Protocol):
         ...
 
 
-class OpenAICompatibleReranker:
+class HttpReranker:
+    """Client for a /rerank endpoint (llama.cpp server, Jina, Cohere-compatible gateways).
+
+    The request carries the query and the documents, and the response lists a relevance
+    score per document index. OpenAI has no reranking API, so unlike the embedder this
+    client does not follow an OpenAI format.
+    """
+
     def __init__(
         self,
         base_url: str,

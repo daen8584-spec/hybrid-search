@@ -52,12 +52,6 @@ def test_a_sentence_longer_than_the_budget_is_split_by_words() -> None:
     assert [c.token_count for c in chunks] == [100, 100, 50]
 
 
-def test_content_hash_is_stable_and_content_based() -> None:
-    a, b = chunk_text("Same text."), chunk_text("Same text.")
-    assert a[0].content_hash == b[0].content_hash
-    assert a[0].content_hash != chunk_text("Other text.")[0].content_hash
-
-
 @pytest.mark.parametrize(("max_tokens", "overlap"), [(0, 0), (10, 10), (10, -1)])
 def test_invalid_budgets_are_rejected(max_tokens: int, overlap: int) -> None:
     with pytest.raises(ValueError):

@@ -26,5 +26,5 @@ Implement BM25 (k1 = 1.2, b = 0.75) in SQL over an inverted index stored in Post
 
 - Keyword retrieval has the same ranking function as common search engines without leaving PostgreSQL, and stays transactionally consistent with the vectors.
 - The inverted index adds one row per distinct lexeme per chunk and makes ingestion write correspondingly more rows.
-- Candidate pruning is an approximation. Its effect is measurable: setting the threshold to 1.0 scores every match.
+- Candidate pruning is an approximation. Its effect is measurable: setting `BM25_MAX_DF_FRACTION` to 1.0 scores every match.
 - Document frequencies are counted at query time. That keeps them exact and maintenance free, at a cost that grows with the frequency of the query terms. At much larger scale, a statistics table refreshed in the background would replace the counts.

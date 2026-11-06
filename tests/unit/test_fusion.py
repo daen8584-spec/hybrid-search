@@ -1,6 +1,6 @@
 import pytest
 
-from hybrid_search.fusion import first_occurrences, reciprocal_rank_fusion
+from hybrid_search.fusion import reciprocal_rank_fusion
 
 
 def test_items_found_by_both_retrievers_rank_first() -> None:
@@ -29,7 +29,3 @@ def test_empty_rankings_produce_no_results() -> None:
 def test_negative_k_is_rejected() -> None:
     with pytest.raises(ValueError):
         reciprocal_rank_fusion({"keyword": ["a"]}, k=-1)
-
-
-def test_first_occurrences_keeps_the_best_rank() -> None:
-    assert first_occurrences(["d1", "d2", "d1", "d3", "d2"]) == ["d1", "d2", "d3"]

@@ -17,14 +17,14 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings, load_dotenv
-from .db import embedding_dimensions, migrate, open_pool
+from .db import SchemaMissingError, embedding_dimensions, migrate, open_pool
 from .embeddings import EmbeddingError, OpenAICompatibleEmbedder
 from .evaluation.beir import CorpusDocument, iter_corpus, load_dataset, safe_extract
 from .evaluation.metrics import mrr_at_k, ndcg_at_k, percentile, recall_at_k
 from .ingest import Ingestor
 from .log import configure_logging
 from .providers import ProviderError
-from .reranker import OpenAICompatibleReranker
+from .reranker import HttpReranker
 from .search import SEARCH_MODES, SearchMode, SearchService, apply_rerank, fuse
 
 logger = logging.getLogger("hybrid_search.cli")
@@ -39,6 +39,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     settings = Settings.from_env()
     configure_logging(settings.log_level)
     from psycopg import OperationalError
+    from psycopg.errors import UndefinedTable
 
     try:
         result = args.handler(args, settings)
@@ -53,6 +54,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     except OperationalError as error:
         print(f"error: database unavailable: {error}".rstrip(), file=sys.stderr)
+        return 1
+    except (SchemaMissingError, UndefinedTable):
+        print("error: the database schema is missing; run `hybrid-search migrate` first", file=sys.stderr)
         return 1
 
 
@@ -235,7 +239,7 @@ async def cmd_eval(args: argparse.Namespace, settings: Settings) -> int:
         runs.append(("hybrid+rerank", "hybrid", True))
     dataset = load_dataset(args.dataset, args.split)
     pool = await open_pool(settings.database_url, max_size=4)
-    embedder = OpenAICompatibleEmbedder(settings)
+    embedder = _query_embedder(settings, len(dataset.queries))
     reranker = _reranker(settings) if args.rerank else None
     try:
         await _check_dimensions(pool, embedder.dimensions)
@@ -318,7 +322,7 @@ async def cmd_tune_rerank(args: argparse.Namespace, settings: Settings) -> int:
     if args.queries < len(queries):
         queries = random.Random(7).sample(queries, args.queries)
     pool = await open_pool(settings.database_url, max_size=4)
-    embedder = OpenAICompatibleEmbedder(settings)
+    embedder = _query_embedder(settings, len(queries))
     reranker = _reranker(settings)
     try:
         await _check_dimensions(pool, embedder.dimensions)
@@ -494,6 +498,15 @@ async def cmd_bench(args: argparse.Namespace, settings: Settings) -> int:
     dataset = load_dataset(args.dataset, args.split)
     queries = [query.text for query in dataset.queries]
     random.Random(7).shuffle(queries)
+    if len(queries) > settings.embedding_query_cache_size:
+        # The cache is least recently used, so a second pass in the same order finds none
+        # of its queries cached and is not a warm pass.
+        print(
+            f"warning: {len(queries)} queries exceed EMBEDDING_QUERY_CACHE_SIZE "
+            f"({settings.embedding_query_cache_size}); set it on the server to at least {len(queries)} "
+            "for a warm second pass",
+            file=sys.stderr,
+        )
 
     async def run_pass(client: httpx.AsyncClient) -> dict[str, Any]:
         latencies: list[float] = []
@@ -542,14 +555,25 @@ async def cmd_bench(args: argparse.Namespace, settings: Settings) -> int:
     return 0 if cold["errors"] == warm["errors"] == 0 else 1
 
 
-def _reranker(settings: Settings) -> OpenAICompatibleReranker:
+def _query_embedder(settings: Settings, queries: int) -> OpenAICompatibleEmbedder:
+    """An embedder whose query cache holds every query, so each is embedded once.
+
+    Retrieval latency is then measured without the embedding call, however many queries
+    the dataset has.
+    """
+    return OpenAICompatibleEmbedder(
+        settings, query_cache_size=max(settings.embedding_query_cache_size, queries)
+    )
+
+
+def _reranker(settings: Settings) -> HttpReranker:
     if not settings.rerank_base_url:
         raise SystemExit("reranking needs RERANK_BASE_URL, for example http://127.0.0.1:8082/v1")
-    return OpenAICompatibleReranker(
+    return HttpReranker(
         settings.rerank_base_url,
         settings.rerank_model,
         settings.rerank_api_key,
-        settings.embedding_timeout_seconds,
+        settings.rerank_timeout_seconds,
     )
 
 

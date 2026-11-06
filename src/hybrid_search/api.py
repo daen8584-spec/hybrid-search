@@ -19,7 +19,7 @@ from .embeddings import Embedder, OpenAICompatibleEmbedder
 from .ingest import Ingestor, IngestStatus
 from .log import configure_logging, request_id
 from .providers import ProviderError
-from .reranker import OpenAICompatibleReranker, Reranker
+from .reranker import HttpReranker, Reranker
 from .search import SearchMode, SearchService
 
 logger = logging.getLogger("hybrid_search.api")
@@ -75,11 +75,11 @@ def create_app(
         owned_reranker = reranker is None and settings.rerank_base_url is not None
         active_reranker: Reranker | None = reranker
         if owned_reranker and settings.rerank_base_url:
-            active_reranker = OpenAICompatibleReranker(
+            active_reranker = HttpReranker(
                 settings.rerank_base_url,
                 settings.rerank_model,
                 settings.rerank_api_key,
-                settings.embedding_timeout_seconds,
+                settings.rerank_timeout_seconds,
             )
         try:
             async with pool.connection() as conn:
@@ -98,7 +98,7 @@ def create_app(
         finally:
             if owned and isinstance(active, OpenAICompatibleEmbedder):
                 await active.aclose()
-            if owned_reranker and isinstance(active_reranker, OpenAICompatibleReranker):
+            if owned_reranker and isinstance(active_reranker, HttpReranker):
                 await active_reranker.aclose()
             await pool.close()
 

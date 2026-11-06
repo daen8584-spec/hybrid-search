@@ -5,7 +5,7 @@ import pytest
 from psycopg import AsyncConnection
 from psycopg_pool import AsyncConnectionPool
 
-from hybrid_search.db import embedding_dimensions, migrate
+from hybrid_search.db import SchemaMissingError, embedding_dimensions, migrate
 from hybrid_search.ingest import Ingestor
 from hybrid_search.search import SearchService
 
@@ -32,6 +32,14 @@ async def test_migrations_are_idempotent_and_match_the_embedding_size(database_u
     async with await AsyncConnection.connect(database_url, autocommit=True) as conn:
         assert await migrate(conn) == []
         assert await embedding_dimensions(conn) == DIMENSIONS
+
+
+async def test_missing_schema_is_reported_without_a_database_error(database_url: str) -> None:
+    async with await AsyncConnection.connect(database_url, autocommit=True) as conn:
+        await conn.execute("create schema if not exists unmigrated")
+        await conn.execute("set search_path to unmigrated")
+        with pytest.raises(SchemaMissingError, match="migrate"):
+            await embedding_dimensions(conn)
 
 
 async def test_upsert_creates_then_skips_unchanged_documents(
@@ -132,6 +140,22 @@ async def test_vector_search_returns_one_result_per_document(corpus: SearchServi
     results = await corpus.rank("bone density vitamin", "vector", 10)
     assert results[0].document_id == "vitamin"
     assert len({doc.document_id for doc in results}) == len(results) == 3
+
+
+async def test_vector_search_fills_the_limit_when_one_document_owns_the_nearest_chunks(
+    pool: AsyncConnectionPool, embedder: HashingEmbedder
+) -> None:
+    ingestor = Ingestor(pool, embedder, max_tokens=12, overlap_tokens=0)
+    # Twelve chunks that all match the query better than any other document.
+    await ingestor.upsert("long", "Long", "\n\n".join(["Tidal energy turbines generate power."] * 12))
+    for i in range(6):
+        await ingestor.upsert(f"other-{i}", "Other", f"Tidal currents vary along coastline {i}.")
+    service = SearchService(pool, embedder)
+    vector = await embedder.embed_query("tidal energy turbines")
+    for exact in (False, True):
+        results = await service.vector(vector, 5, exact=exact)
+        assert len(results) == 5
+        assert results[0].document_id == "long"
 
 
 async def test_exact_and_indexed_vector_search_agree(

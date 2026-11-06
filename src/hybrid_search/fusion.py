@@ -24,14 +24,3 @@ def reciprocal_rank_fusion[T: Hashable](
         for rank, item in enumerate(ranking, start=1):
             scores[item] = scores.get(item, 0.0) + weight / (k + rank)
     return sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
-
-
-def first_occurrences[T: Hashable](items: Sequence[T]) -> list[T]:
-    """Removes duplicates, keeping the first (best ranked) occurrence of each item."""
-    seen: set[T] = set()
-    unique: list[T] = []
-    for item in items:
-        if item not in seen:
-            seen.add(item)
-            unique.append(item)
-    return unique

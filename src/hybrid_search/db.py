@@ -58,12 +58,16 @@ async def migrate(conn: AsyncConnection) -> list[str]:
         await conn.execute("select pg_advisory_unlock(%s)", (MIGRATION_LOCK_ID,))
 
 
+class SchemaMissingError(RuntimeError):
+    """The tables do not exist yet: migrations have not been applied to this database."""
+
+
 async def embedding_dimensions(conn: AsyncConnection) -> int:
     """Reads the dimension declared on chunks.embedding, to verify it matches the configured model."""
     cursor = await conn.execute(
-        "select atttypmod from pg_attribute where attrelid = 'chunks'::regclass and attname = 'embedding'"
+        "select atttypmod from pg_attribute where attrelid = to_regclass('chunks') and attname = 'embedding'"
     )
     row = await cursor.fetchone()
     if row is None:
-        raise RuntimeError("chunks.embedding not found; run `hybrid-search migrate` first")
+        raise SchemaMissingError("the database schema is missing; run `hybrid-search migrate` first")
     return int(row[0])

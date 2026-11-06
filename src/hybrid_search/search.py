@@ -83,8 +83,16 @@ best as (
     from nearest
     order by document_id, distance, id
 )
-select document_id, id, 1 - distance as score from best order by distance, document_id limit %(limit)s
+select document_id, id, 1 - distance as score, (select count(*) from nearest) as fetched
+from best order by distance, document_id limit %(limit)s
 """
+
+# Vector search ranks chunks, and a document can own several of the nearest chunks, so the
+# first fetch takes twice as many chunks as documents requested. When those chunks cover
+# fewer than `limit` documents, the fetch is repeated with four times as many chunks, up to
+# this multiple of `limit`. A document is missed only when more chunks than that rank above
+# its best chunk.
+_VECTOR_MAX_CHUNKS_PER_RESULT = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +176,7 @@ class SearchService:
             embedder,
             ef_search=settings.hnsw_ef_search,
             weights={"keyword": settings.fusion_keyword_weight, "vector": 1.0},
+            max_df_fraction=settings.bm25_max_df_fraction,
             reranker=reranker,
             rerank_depth=settings.rerank_depth,
             rerank_weight=settings.rerank_weight,
@@ -220,7 +229,18 @@ class SearchService:
         With exact=True the index is bypassed and every chunk is compared, which gives the
         ground truth for measuring HNSW recall.
         """
-        params = {"vector": to_vector_literal(vector), "chunks": limit * 2, "limit": limit}
+        chunks = limit * 2
+        while True:
+            rows, fetched = await self._nearest(vector, chunks, limit, ef_search, exact)
+            if len(rows) >= limit or fetched < chunks or chunks >= limit * _VECTOR_MAX_CHUNKS_PER_RESULT:
+                return rows
+            chunks = min(chunks * 4, limit * _VECTOR_MAX_CHUNKS_PER_RESULT)
+
+    async def _nearest(
+        self, vector: Sequence[float], chunks: int, limit: int, ef_search: int | None, exact: bool
+    ) -> tuple[list[Candidate], int]:
+        """Best chunk per document among the `chunks` nearest, and how many chunks were found."""
+        params = {"vector": to_vector_literal(vector), "chunks": chunks, "limit": limit}
         async with self._pool.connection() as conn, conn.transaction():
             if exact:
                 await conn.execute("select set_config('enable_indexscan', 'off', true)")
@@ -237,7 +257,10 @@ class SearchService:
                 await conn.execute("select set_config('enable_seqscan', 'off', true)")
             cursor = await conn.execute(_VECTOR_SQL, params)
             rows = await cursor.fetchall()
-        return [Candidate(document_id, chunk_id, float(score)) for document_id, chunk_id, score in rows]
+        fetched = int(rows[0][3]) if rows else 0
+        return [
+            Candidate(document_id, chunk_id, float(score)) for document_id, chunk_id, score, _ in rows
+        ], fetched
 
     async def rank(
         self, query: str, mode: SearchMode, limit: int, rerank: bool = False
