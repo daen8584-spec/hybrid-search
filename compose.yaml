@@ -1,0 +1,46 @@
+# The search API, PostgreSQL with pgvector, and a local embedding model served by llama.cpp.
+# The embedding model (about 140 MB) is downloaded on the first start into the `models` volume.
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: hybrid_search
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "hybrid_search"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  embeddings:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command:
+      [
+        "-hf", "nomic-ai/nomic-embed-text-v1.5-GGUF:Q8_0",
+        "--embeddings", "--host", "0.0.0.0", "--port", "8081",
+        "-c", "2048", "-b", "2048", "-ub", "2048",
+      ]
+    environment:
+      LLAMA_CACHE: /models
+    volumes:
+      - models:/models
+
+  api:
+    build: .
+    image: hybrid-search:local
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/hybrid_search
+      EMBEDDING_BASE_URL: http://embeddings:8081/v1
+      LOG_LEVEL: INFO
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db-data:
+  models:

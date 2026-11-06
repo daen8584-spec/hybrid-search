@@ -38,3 +38,19 @@ jobs:
       - run: mypy
       - run: pytest -m "not integration"
       - run: pytest -m integration
+
+  docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      # The embedding service is not started: the checks below do not need a model.
+      - name: Build and start the API and database
+        run: docker compose up -d --build --wait db api
+      - name: Check the API
+        run: |
+          curl -fsS http://127.0.0.1:8000/health
+          test "$(curl -fsS 'http://127.0.0.1:8000/search?q=aspirin&mode=keyword' | python3 -c 'import json,sys; print(json.load(sys.stdin)["results"])')" = "[]"
+          test "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8000/search?q=aspirin&rerank=true')" = "400"
+      - name: Container logs
+        if: always()
+        run: docker compose logs

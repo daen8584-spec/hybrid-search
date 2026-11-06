@@ -198,6 +198,15 @@ hybrid-search migrate
 hybrid-search serve --port 8000
 ```
 
+### With Docker
+
+```bash
+docker compose up -d --build
+curl -s localhost:8000/health
+```
+
+This starts the API, PostgreSQL with pgvector and `llama-server` with `nomic-embed-text-v1.5`, which downloads the model (about 140 MB) on the first start. The API applies migrations when it starts and listens on `127.0.0.1:8000`. CI builds the image and checks the API against the database on every push.
+
 ### Configuration
 
 | Variable | Default | Description |
