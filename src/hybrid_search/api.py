@@ -19,6 +19,7 @@ from .embeddings import Embedder, OpenAICompatibleEmbedder
 from .ingest import Ingestor, IngestStatus
 from .log import configure_logging, request_id
 from .providers import ProviderError
+from .query_cache import PostgresQueryCache
 from .reranker import HttpReranker, Reranker
 from .search import SearchMode, SearchService
 
@@ -72,6 +73,14 @@ def create_app(
         pool = await open_pool(settings.database_url)
         owned = embedder is None
         active: Embedder = embedder or OpenAICompatibleEmbedder(settings)
+        if settings.embedding_shared_cache and isinstance(active, OpenAICompatibleEmbedder):
+            active.shared_cache = PostgresQueryCache(
+                pool,
+                active.model,
+                active.dimensions,
+                settings.embedding_shared_cache_ttl_seconds,
+                settings.embedding_shared_cache_max_rows,
+            )
         owned_reranker = reranker is None and settings.rerank_base_url is not None
         active_reranker: Reranker | None = reranker
         if owned_reranker and settings.rerank_base_url:

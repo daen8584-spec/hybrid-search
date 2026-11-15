@@ -167,3 +167,63 @@ async def test_no_authorization_header_without_a_key() -> None:
         return vectors_for(request)
 
     await embedder(handler, embedding_api_key=None).embed_query("x")
+
+
+class FakeSharedCache:
+    """Stands in for PostgresQueryCache, keyed by the text sent to the provider."""
+
+    def __init__(self, entries: dict[str, list[float]] | None = None) -> None:
+        self.entries = dict(entries or {})
+        self.reads: list[str] = []
+
+    async def get(self, text: str) -> list[float] | None:
+        self.reads.append(text)
+        return self.entries.get(text)
+
+    async def put(self, text: str, embedding: list[float]) -> None:
+        self.entries[text] = embedding
+
+
+async def test_shared_cache_is_used_after_the_local_cache() -> None:
+    calls: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content)["input"])
+        return vectors_for(request)
+
+    shared = FakeSharedCache({"q: known": [9.0, 9.0, 9.0]})
+    client = embedder(handler)
+    client.shared_cache = shared  # type: ignore[assignment]
+
+    assert await client.embed_query("known") == [9.0, 9.0, 9.0]
+    assert calls == []
+    assert client.shared_cache_hits == 1
+
+    # A miss in both caches calls the provider and stores the result in the shared cache,
+    # keyed by the text sent to the provider, prefix included.
+    assert await client.embed_query("new") == [6.0, 0.0, 1.0]
+    assert calls == [["q: new"]]
+    assert shared.entries["q: new"] == [6.0, 0.0, 1.0]
+    assert client.provider_query_calls == 1
+
+    # Both are now in the local cache, so the shared cache is not read again.
+    shared.reads.clear()
+    await client.embed_query("known")
+    await client.embed_query("new")
+    assert shared.reads == []
+    assert client.cache_hits == 2
+
+
+async def test_two_processes_share_query_embeddings() -> None:
+    calls: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content)["input"])
+        return vectors_for(request)
+
+    shared = FakeSharedCache()
+    first, second = embedder(handler), embedder(handler)
+    first.shared_cache = second.shared_cache = shared  # type: ignore[assignment]
+    await first.embed_query("aspirin")
+    assert await second.embed_query("aspirin") == await first.embed_query("aspirin")
+    assert calls == [["q: aspirin"]]

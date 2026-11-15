@@ -64,3 +64,28 @@ def test_invalid_numbers_name_the_variable(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("FUSION_KEYWORD_WEIGHT", "high")
     with pytest.raises(ValueError, match="FUSION_KEYWORD_WEIGHT"):
         Settings.from_env()
+
+
+def test_shared_query_cache_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "EMBEDDING_SHARED_CACHE",
+        "EMBEDDING_SHARED_CACHE_TTL_SECONDS",
+        "EMBEDDING_SHARED_CACHE_MAX_ROWS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings.from_env()
+    assert settings.embedding_shared_cache is False
+    assert settings.embedding_shared_cache_ttl_seconds == 86_400.0
+    assert settings.embedding_shared_cache_max_rows == 100_000
+
+    monkeypatch.setenv("EMBEDDING_SHARED_CACHE", "true")
+    monkeypatch.setenv("EMBEDDING_SHARED_CACHE_TTL_SECONDS", "60")
+    monkeypatch.setenv("EMBEDDING_SHARED_CACHE_MAX_ROWS", "500")
+    settings = Settings.from_env()
+    assert settings.embedding_shared_cache is True
+    assert settings.embedding_shared_cache_ttl_seconds == 60.0
+    assert settings.embedding_shared_cache_max_rows == 500
+
+    monkeypatch.setenv("EMBEDDING_SHARED_CACHE", "maybe")
+    with pytest.raises(ValueError, match="EMBEDDING_SHARED_CACHE must be true or false"):
+        Settings.from_env()

@@ -38,6 +38,17 @@ def _float(name: str, default: float) -> float:
         raise ValueError(f"{name} must be a number, got {raw!r}") from error
 
 
+def _bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} must be true or false, got {raw!r}")
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     database_url: str
@@ -62,6 +73,10 @@ class Settings:
     rerank_timeout_seconds: float
     bm25_max_df_fraction: float
     log_level: str
+    # Query embedding cache shared by API processes in PostgreSQL (docs/adr/0009).
+    embedding_shared_cache: bool = False
+    embedding_shared_cache_ttl_seconds: float = 86_400.0
+    embedding_shared_cache_max_rows: int = 100_000
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -89,4 +104,7 @@ class Settings:
             rerank_timeout_seconds=_float("RERANK_TIMEOUT_SECONDS", 60.0),
             bm25_max_df_fraction=_float("BM25_MAX_DF_FRACTION", 0.1),
             log_level=env.get("LOG_LEVEL", "INFO").upper(),
+            embedding_shared_cache=_bool("EMBEDDING_SHARED_CACHE", False),
+            embedding_shared_cache_ttl_seconds=_float("EMBEDDING_SHARED_CACHE_TTL_SECONDS", 86_400.0),
+            embedding_shared_cache_max_rows=_int("EMBEDDING_SHARED_CACHE_MAX_ROWS", 100_000),
         )

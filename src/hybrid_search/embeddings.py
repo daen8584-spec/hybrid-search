@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Sequence
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import httpx
 
 from .config import Settings
 from .providers import ProviderError, post_json
+
+if TYPE_CHECKING:
+    from .query_cache import PostgresQueryCache
 
 
 class EmbeddingError(ProviderError):
@@ -28,7 +31,11 @@ class Embedder(Protocol):
 
 
 class OpenAICompatibleEmbedder:
-    """Batches document embeddings, caches query embeddings and retries transient failures."""
+    """Batches document embeddings, caches query embeddings and retries transient failures.
+
+    Query embeddings are cached in memory and, when a shared cache is attached, in
+    PostgreSQL for every API process (docs/adr/0009).
+    """
 
     def __init__(
         self,
@@ -36,6 +43,7 @@ class OpenAICompatibleEmbedder:
         client: httpx.AsyncClient | None = None,
         max_attempts: int = 3,
         query_cache_size: int | None = None,
+        shared_cache: PostgresQueryCache | None = None,
     ) -> None:
         self.model = settings.embedding_model
         self.dimensions = settings.embedding_dimensions
@@ -49,8 +57,11 @@ class OpenAICompatibleEmbedder:
         self._query_cache_size = (
             settings.embedding_query_cache_size if query_cache_size is None else query_cache_size
         )
+        self.shared_cache = shared_cache
         self.prompt_tokens = 0
         self.cache_hits = 0
+        self.shared_cache_hits = 0
+        self.provider_query_calls = 0
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -69,7 +80,15 @@ class OpenAICompatibleEmbedder:
             self._query_cache.move_to_end(text)
             self.cache_hits += 1
             return cached
-        [vector] = await self._embed([self._settings.embedding_query_prefix + text])
+        provider_text = self._settings.embedding_query_prefix + text
+        vector = await self.shared_cache.get(provider_text) if self.shared_cache else None
+        if vector is not None:
+            self.shared_cache_hits += 1
+        else:
+            [vector] = await self._embed([provider_text])
+            self.provider_query_calls += 1
+            if self.shared_cache:
+                await self.shared_cache.put(provider_text, vector)
         self._query_cache[text] = vector
         if len(self._query_cache) > self._query_cache_size:
             self._query_cache.popitem(last=False)
