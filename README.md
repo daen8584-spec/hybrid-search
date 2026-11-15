@@ -10,7 +10,7 @@ A retrieval service that combines BM25 keyword search with pgvector similarity s
 - **BM25 in SQL** over an inverted index in PostgreSQL, with pruning of very common terms to bound query cost
 - **Single datastore**: documents, chunks, inverted index and HNSW vector index live in PostgreSQL, updated in one transaction
 - **Incremental ingestion**: unchanged documents are skipped, and chunks whose text did not change reuse their stored embedding
-- **Any OpenAI-compatible embedding provider**, including a local `llama-server`, with batching, retries, response validation and a query embedding cache
+- **Any OpenAI-compatible embedding provider**, including a local `llama-server`, with batching, retries, response validation and a query embedding cache, optionally shared by every API process through PostgreSQL
 - **Evaluation** on BEIR datasets with nDCG@10, Recall@10, Recall@100 and MRR@10, and latency measured separately from the embedding call
 - **Tuning** of HNSW `ef_search` against exact search, and of the fusion weights on a separate query split
 - **Optional reranking** of the top results with a cross-encoder, combined with the first-stage ranking by rank fusion and tuned on a separate query split
@@ -99,6 +99,17 @@ With uncached queries, throughput is bounded by the embedding model, which runs 
 
 Ingesting the corpus embedded about 1.8 million tokens and took about three hours on this device, almost all of it in the embedding model.
 
+### Shared query embedding cache
+
+Since the embedding model dominates uncached latency, query embeddings can also be cached in PostgreSQL for every API process (`EMBEDDING_SHARED_CACHE=true`). Measured with `scripts/bench_query_cache.py`: 4 processes, each with its own in-memory cache of 2,048 entries, embedding 2,000 queries each from a Zipf distribution over 5,000 distinct queries, against a stub provider that answers in 150 ms. Mean of two runs:
+
+| Shared cache | Provider calls | Hit rate | Mean embedding time | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| no | 3,183 | 60.2% | 64.3 ms | 161 ms | 165 ms |
+| yes | 2,030 | 74.7% | 42.1 ms | 167 ms | 176 ms |
+
+Provider calls fell by about 36%. Misses pay for the extra lookup: p95 rose by about 6 ms. This measures the query embedding step with a stub provider, not the full API with a real model; see [0009](docs/adr/0009-shared-query-embedding-cache.md).
+
 ## Architecture
 
 ```mermaid
@@ -132,6 +143,7 @@ Significant decisions are documented as [Architecture Decision Records](docs/adr
 - [0005](docs/adr/0005-hnsw-index.md) An HNSW index whose recall is measured against exact search
 - [0006](docs/adr/0006-synchronous-ingestion.md) Synchronous ingestion with embedding reuse
 - [0008](docs/adr/0008-reranking.md) Optional cross-encoder reranking fused with the first-stage ranking
+- [0009](docs/adr/0009-shared-query-embedding-cache.md) A query embedding cache shared by API processes, in an unlogged PostgreSQL table
 
 ## API
 
@@ -222,6 +234,8 @@ This starts the API, PostgreSQL with pgvector and `llama-server` with `nomic-emb
 | `EMBEDDING_BATCH_SIZE` | `16` | Chunks per embedding request |
 | `EMBEDDING_TIMEOUT_SECONDS` | `60` | Timeout of each embedding request |
 | `EMBEDDING_QUERY_CACHE_SIZE` | `2048` | Query embeddings kept in memory, least recently used evicted first; `bench` needs at least as many as the dataset has queries for a warm second pass |
+| `EMBEDDING_SHARED_CACHE` | `false` | Also cache query embeddings in PostgreSQL, shared by every API process ([0009](docs/adr/0009-shared-query-embedding-cache.md)) |
+| `EMBEDDING_SHARED_CACHE_TTL_SECONDS`, `EMBEDDING_SHARED_CACHE_MAX_ROWS` | `86400`, `100000` | Lifetime of a shared cache entry, and the number of entries kept |
 | `CHUNK_MAX_TOKENS`, `CHUNK_OVERLAP_TOKENS` | `384`, `48` | Chunk size and overlap, in approximate tokens |
 | `HNSW_EF_SEARCH` | `40` | HNSW candidate list size per query; see `ann-sweep` |
 | `FUSION_KEYWORD_WEIGHT` | `1.0` | Weight of the keyword ranking in fusion, relative to the vector ranking; see `tune-fusion` |
@@ -289,6 +303,7 @@ src/hybrid_search/
   config.py       Settings from the environment
   db.py           Connection pool, migrations, pgvector helpers
   embeddings.py   OpenAI-compatible embedding client
+  query_cache.py  Query embedding cache shared by API processes, in PostgreSQL
   fusion.py       Reciprocal Rank Fusion
   ingest.py       Document ingestion with embedding reuse
   search.py       Keyword, vector and hybrid retrieval
@@ -297,6 +312,7 @@ src/hybrid_search/
 tests/
   unit/           Tests without external dependencies
   integration/    Tests against PostgreSQL with pgvector
+scripts/          Measurement scripts
 docs/adr/         Architecture Decision Records
 ```
 
@@ -304,7 +320,6 @@ docs/adr/         Architecture Decision Records
 
 - Keyword search counts document frequencies at query time and skips chunks that contain only very common query terms. Both are exact or measured at this scale; see [0007](docs/adr/0007-bm25-in-postgresql.md) for what changes at a larger one.
 - Token counts used for chunking are approximate and independent of the embedding model's tokenizer. The default chunk size leaves a wide margin below the model's context length.
-- The query embedding cache is per process. Several API processes each maintain their own.
 
 ## License
 
